@@ -205,4 +205,4 @@ TF 上电挂载，空闲约每 2 秒检查，重新插入时读写临时文件�
 
 v0.4.13 已在 CAM 实机仅更新 app，并验证 TF 会话测试内容跨重启恢复、菜单编辑/30 分钟上限、布局/语言检查、ASR 101 和 AI 网络检测。用户随后确认实体操作手感正常。最后一轮不包含真人 ASR、多图模型推理、物理 TF 拔插验收，不能将网络正常等同于识别/回答质量通过。
 
-公开离线测试运行说明见 [tools/README.md](tools/README.md)。它们不连接设备。源码的第三方字形许可见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。项目自身当前未额外授予开源许可证；公开可见不等于授予任意再分发许可。
+公开离线测试运行说明见 [tools/README.md](tools/README.md)。它们不连接设备。源码的第三方字形许可见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。项目代码按 [MIT License](LICENSE) 开源，版权为 2026 h9647123。Noto 派生字形继续适用 SIL OFL 1.1，其他第三方依赖保留各自许可证；MIT 不替代这些第三方条款。

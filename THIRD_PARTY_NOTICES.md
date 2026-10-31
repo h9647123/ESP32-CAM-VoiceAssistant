@@ -4,4 +4,4 @@
 
 The build uses Arduino ESP32 / ESP-IDF (including esp32-camera), ArduinoJson, LovyanGFX, WebSockets and zlib_turbo as separately installed dependencies. This repository does not redistribute their SDK/library packages; consult the license included in each dependency. Their names are used to identify build requirements.
 
-No additional license for the project code is selected by this publication. Existing third-party notices remain applicable.
+Project code is distributed under the MIT License; see `LICENSE` (Copyright (c) 2026 h9647123). Third-party components and font-derived assets retain their own copyright notices and licenses. The project MIT License does not replace or relicense those third-party materials.
