@@ -1,0 +1,117 @@
+#pragma once
+
+// Copy this file to config.h before compiling.
+// These values are defaults. Serial commands such as `connect`, `asrkey`,
+// `llmkey`, `model/models`, `llmbase`, and `llmurl` save overrides in ESP32 NVS.
+
+// Wi-Fi
+#define WIFI_SSID ""
+#define WIFI_PASSWORD ""
+
+// Volcengine / Doubao ASR big-model streaming API.
+// Docs: https://www.volcengine.com/docs/6561/1354869?lang=zh
+#define VOLC_ASR_HOST "openspeech.bytedance.com"
+#define VOLC_ASR_PATH "/api/v3/sauc/bigmodel"
+#define VOLC_ASR_API_KEY ""
+// Legacy credentials are still supported when VOLC_ASR_API_KEY is empty.
+#define VOLC_ASR_APP_KEY ""
+#define VOLC_ASR_ACCESS_KEY ""
+#define VOLC_ASR_RESOURCE_ID "volc.bigasr.sauc.duration"
+
+// Audio request defaults.
+#define VOLC_ASR_UID "esp32s3-r16n8"
+#define VOLC_ASR_MODEL_NAME "bigmodel"
+#define VOLC_ASR_LANGUAGE "zh-CN"
+
+// Preferred ASR: iFlytek IAT large-model Chinese/English V2.0. Runtime configuration:
+//   asrprovider xfyun2
+//   xfyun2asr <appid> <apikey> <apisecret>
+// READY requires all three values; keep credentials in local NVS, not source.
+// Docs: https://www.xfyun.cn/doc/spark/spark_zh_iat_new.html
+#define XFYUN_IAT_HOST "iat.cn-huabei-1.xf-yun.com"
+#define XFYUN_IAT_PATH "/v1"
+#define XFYUN_ASR_APP_ID ""
+#define XFYUN_ASR_API_KEY ""
+#define XFYUN_ASR_API_SECRET ""
+#define XFYUN_ASR_LANGUAGE "mix"
+
+// H9647123 local ASR HTTP API. The board connects to the LAN address and
+// sends the virtual host header used by the reverse proxy. Configure the key
+// at runtime with `h964asr <api_key>`; it is never printed in full.
+#define H964_ASR_URL "http://192.168.0.111/api/asr"
+#define H964_ASR_HOST_HEADER "h9647123.cn"
+#define H964_ASR_API_KEY ""
+#define H964_ASR_LANGUAGE "auto"
+#define H964_ASR_MODEL ""
+#define H964_ASR_TIMEOUT_MS 240000UL
+
+// OpenAI-compatible chat endpoint.
+// DeepSeek runtime setup: provideradd deepseek https://api.deepseek.com <api_key>
+// This automatically offers deepseek-flash (vision) and the inherited text models.
+// Volcengine Ark:
+// https://ark.cn-beijing.volces.com/api/v3/chat/completions
+// DeepSeek:
+// https://api.deepseek.com/chat/completions
+#define LLM_API_URL "https://api.deepseek.com/chat/completions"
+#define LLM_API_KEY ""
+#define LLM_MODEL_ID "deepseek-flash"
+#define LLM_SYSTEM_PROMPT "You are a concise helpful assistant. Reply in Chinese unless the user asks otherwise."
+
+// GMT130-v1.0 / ST7789 240x240 SPI display.
+// The sketch uses LovyanGFX built-in fonts::efontCN_16 for Chinese UI text.
+#define TFT_MOSI 47
+#define TFT_SCLK 48
+#define TFT_RST -1
+#define TFT_DC 2
+#define TFT_BL 39
+#define TFT_CS -1
+#define TFT_SPI_HOST SPI2_HOST
+#define TFT_INVERT_COLOR true
+#define TFT_RGB_ORDER false
+#define TFT_OFFSET_X 0
+#define TFT_OFFSET_Y 0
+#define TFT_ROTATION 0  // 0 = normal, 2 = 180 degrees
+
+// INMP441 I2S microphone. Wire L/R to GND for left channel.
+#define MIC_I2S_PORT I2S_NUM_0
+#define MIC_I2S_BCLK 14
+#define MIC_I2S_WS 21
+#define MIC_I2S_DIN 1
+#define MIC_SAMPLE_RATE 16000
+#define MIC_SAMPLE_BITS 16
+#define MIC_SAMPLE_SHIFT 16
+
+// CAM has no environment sensor. GPIO16/17/18 belong to OV2640.
+
+
+// Buttons: one side to GPIO, the other side to GND. Internal pull-up is enabled.
+// CAM A=GPIO42, B=GPIO38, C=GPIO3. BOOT is GPIO0 and is not a function key.
+// Page1: tap A opens settings; hold A starts/stops a voice question; B/C scroll chat.
+// Page2: A selects/applies or hold A returns; B/C move or change menu values.
+// After screen sleep, B/C wake and keep the same scroll/menu action; hold A wakes and starts voice.
+// If ASR is not configured, hold A from the error screen opens the VOICE/ASR setting.
+// Wi-Fi and Model menu items switch among profiles saved by serial commands.
+#define BUTTON_START_PIN 42
+#define BUTTON_NEXT_PIN 38
+#define BUTTON_PREV_PIN 3
+#define BUTTON_ACTIVE_LOW true
+#define BUTTON_LONG_PRESS_MS 800
+#define BUTTON_FAST_REPEAT_MS 160
+
+// Runtime behavior.
+#define AUDIO_CHUNK_MS 200
+#define MAX_RECORD_SECONDS 12
+// CUSTOM IAT has its own automatic recording cutoff (tail capture follows).
+#define CUSTOM_IAT_MAX_RECORD_SECONDS 60
+#define ASR_CONNECT_TIMEOUT_MS 8000
+#define ASR_FINAL_TIMEOUT_MS 12000
+#define LLM_TIMEOUT_MS 30000
+
+// Screen UI notes:
+// Page1 shows NTP time, Wi-Fi status, ASR user
+// input, LLM output, and MIC status. Page2 menu controls brightness 1-100,
+// sleep timeout 0-30 minutes (0 disables sleep), and clear-chat-history/save.
+// Use serial `configexport` on a configured board, then paste the VA-CFG block
+// into a target board to migrate Wi-Fi/API/model/prompt settings.
+
+// CAM pins are enforced by cam_board.h. Credentials stay blank; configure in NVS.

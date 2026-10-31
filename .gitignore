@@ -1,0 +1,16 @@
+VoiceAssistant/config.h
+private-backup/
+.build*/
+validation/
+artifacts/
+__pycache__/
+*.pyc
+*.bin
+*.elf
+*.map
+*.wav
+*.pcm
+*.avi
+*.mp4
+*.vacfg*
+.env*
