@@ -124,11 +124,14 @@ static void serviceProbeWorker(void* argument) {
 static void requestBackgroundServiceCheck() {
   if(WiFi.status()!=WL_CONNECTED) {
     serviceCheckSummary="OFFLINE";
+    serviceCheckDetail=uiText("网络未连接，请先连接Wi-Fi","Offline; connect Wi-Fi first","Offline; connect Wi-Fi first");
     footerStatusDetail=uiText("网络未连接", "Offline", "Offline");
     Serial.println("[HEALTH] manual rejected: offline; no reconnect attempted");
     return;
   }
   servicePending=serviceFullPending=true;
+  serviceCheckSummary="Checking connections";
+  serviceCheckDetail=uiText("正在检测语音与AI连接...","Checking ASR and AI connections...","Checking ASR and AI connections...");
   Serial.println("[HEALTH] manual check queued");
 }
 
@@ -148,6 +151,15 @@ static void serviceMonitorTick() {
       serviceCheckFingerprint=job.fingerprint;
       serviceCheckUptimeMs=millis(); serviceCheckBootId=runtimeBootId;
       serviceCheckLastAt=dateText()+" "+timeText();
+      serviceCheckDetail="";
+      if(!job.asrOk || (job.full && !job.aiOk)) {
+        const bool asr=!job.asrOk;const String phase=asr?job.asrDetail:job.aiDetail;
+        serviceCheckDetail=asr?uiText("语音：","ASR: ","ASR: "):uiText("AI：","AI: ","AI: ");
+        if(phase=="not_configured")serviceCheckDetail+=uiText("尚未配置","not configured","not configured");
+        else if(phase=="clock_not_ready" || phase=="tls_clock_or_trust")serviceCheckDetail+=uiText("校时或证书异常","clock/certificate error","clock/certificate error");
+        else if((asr?job.asrHttp:job.aiHttp)>0)serviceCheckDetail+="HTTP "+String(asr?job.asrHttp:job.aiHttp);
+        else serviceCheckDetail+=uiText("连接或响应超时","connection/header timeout","connection/header timeout");
+      }
       ++serviceCompleted;
       Serial.printf("[HEALTH] done sequence=%lu asr=%d ws_http=%d full=%d ai_net=%d ai_http=%d elapsed_ms=%lu\n",
           (unsigned long)serviceCompleted,job.asrOk,job.asrHttp,job.full,job.aiOk,job.aiHttp,(unsigned long)job.elapsed);

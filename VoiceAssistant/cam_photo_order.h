@@ -3,6 +3,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <ctype.h>
+#include <time.h>
 
 // The sequence is the timeline; wall time is only a label. NTP correction or
 // an offline boot must not reorder photographs. Legacy files have no sequence.
@@ -30,6 +31,17 @@ static CamPhotoKey camParsePhotoKey(const char* path, int64_t legacyTime = 0) {
     if (sscanf(name, "P%16llx_T%10llu.jpg", &order, &epoch) == 2 && order) {
       key.order = order;
       key.epoch = camValidPhotoTime(epoch) ? int64_t(epoch) : 0;
+      return key;
+    }
+  }
+  const char* stamp=!strncmp(name,"P-V-",4)?name+4:(!strncmp(name,"V-",2)||!strncmp(name,"P-",2))?name+2:nullptr;
+  if(stamp && strlen(stamp)>=18) {
+    bool digits=true;for(int i=0;i<14;++i)digits&=isdigit((unsigned char)stamp[i])!=0;
+    int y,m,d,h,n,sec;
+    if(digits && stamp[14]=='.' && sscanf(stamp,"%4d%2d%2d%2d%2d%2d",&y,&m,&d,&h,&n,&sec)==6 && m>=1 && m<=12 && d>=1 && d<=31 && h<24 && n<60 && sec<60) {
+      struct tm value={};value.tm_year=y-1900;value.tm_mon=m-1;value.tm_mday=d;value.tm_hour=h;value.tm_min=n;value.tm_sec=sec;value.tm_isdst=-1;
+      const int64_t epoch=mktime(&value);
+      if(value.tm_year==y-1900 && value.tm_mon==m-1 && value.tm_mday==d && camValidPhotoTime(epoch))key.epoch=epoch;
       return key;
     }
   }

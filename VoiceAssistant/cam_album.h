@@ -1,13 +1,104 @@
 #pragma once
 #include <algorithm>
+#include <dirent.h>
+#include <sys/stat.h>
+#include <errno.h>
 
+// Sidecar markers leave the original JPEG and its ordering metadata intact.
+// The panel has no unhide entry; serial and deleting .hidden on a PC restore it.
+static bool camPhotoHidden(const String& path,bool& ioOk) {
+  struct stat info={};const String marker=String("/sdcard")+path+".hidden";
+  errno=0;if(stat(marker.c_str(),&info)==0){ioOk=S_ISREG(info.st_mode);return ioOk;}
+  ioOk=errno==ENOENT;return false;
+}
+static bool camSetPhotoHidden(const String& path,bool hidden) {
+  CamMediaDeleteState target;if(!target.begin(false,0,path.c_str()) || !camSdReady || !SD_MMC.exists(path))return false;
+  const String marker=path+".hidden";
+  bool ok=false;
+  if(hidden) {
+    if(SD_MMC.exists(marker))ok=true;
+    else {
+      String temp;do{temp=marker+"-"+String(esp_random(),HEX)+".tmp";}while(SD_MMC.exists(temp));
+      File file=SD_MMC.open(temp,FILE_WRITE);ok=file && file.write((const uint8_t*)"CAMHIDE1",8)==8;
+      if(file){file.flush();file.close();}
+      if(ok)ok=SD_MMC.rename(temp,marker);
+      if(!ok)SD_MMC.remove(temp); // Only this operation's newly created temporary marker.
+    }
+  }else ok=!SD_MMC.exists(marker) || SD_MMC.remove(marker);
+  if(ok)camMediaChanged(path);return ok;
+}
 struct CamAlbumItem { String path; CamPhotoKey key; };
+// Close directory handles before opening metadata. FAT's small open-file limit
+// used to turn nested directory/file/metadata opens into a silent partial list.
+static bool camScanMediaNames(const char* folder,const char* extension,std::vector<String>& names) {
+  names.clear();const String native=String("/sdcard")+folder;
+  DIR* dir=opendir(native.c_str());if(!dir)return errno==ENOENT;
+  int error=0;
+  for(;;){errno=0;auto* entry=readdir(dir);if(!entry){error=errno;break;}
+    const String name=entry->d_name;
+    if(name.endsWith(extension) && name.indexOf('/')<0 && name.indexOf("..")<0)names.push_back(String(folder)+"/"+name);
+    yield();
+  }
+  closedir(dir);std::sort(names.begin(),names.end());return error==0;
+}
+// A complete index survives closing the view. A mount or media mutation
+// invalidates it; failed refreshes never replace the last complete index.
+struct CamMediaIndex {
+  std::vector<String> names;std::vector<CamAlbumItem> items;
+  size_t next=0,totalFiles=0,hiddenCount=0;uint64_t maxOrder=0;uint32_t revision=0,started=0;bool building=false,valid=false;
+};
+static CamMediaIndex camPhotoIndexCache,camVideoIndexCache;
+static uint32_t camMediaCacheRevision(const CamMediaIndex& cache){return &cache==&camPhotoIndexCache?camPhotoIndexRevision:camVideoIndexRevision;}
+static CamMediaIndex& camMediaIndex(const char* folder){return !strcmp(folder,"/photo")?camPhotoIndexCache:camVideoIndexCache;}
+static bool camMediaIndexBegin(const char* folder,const char* extension,CamMediaIndex& cache) {
+  std::vector<String> names,verify;
+  if(!camScanMediaNames(folder,extension,names) || !camScanMediaNames(folder,extension,verify) || names!=verify)return false;
+  cache.names.swap(names);cache.items.clear();cache.next=0;cache.totalFiles=cache.names.size();cache.hiddenCount=0;cache.maxOrder=0;cache.revision=camMediaCacheRevision(cache);
+  cache.items.reserve(cache.names.size());cache.started=millis();cache.building=true;cache.valid=false;return true;
+}
+static bool camMediaIndexStep(CamMediaIndex& cache) {
+  if(!camSdReady || cache.revision!=camMediaCacheRevision(cache)){cache.building=false;return false;}
+  if(cache.next<cache.names.size()) {
+    const String& path=cache.names[cache.next];struct stat info={};const String native=String("/sdcard")+path;
+    if(stat(native.c_str(),&info)!=0){cache.building=false;Serial.printf("[MEDIA-INDEX] stat_failed errno=%d\n",errno);return false;}
+    if(S_ISREG(info.st_mode)) {
+      bool ioOk=true;const bool hidden=(&cache==&camPhotoIndexCache) && camPhotoHidden(path,ioOk);
+      if(!ioOk){cache.building=false;return false;}
+      const auto key=camReadMediaKey(path,info.st_mtime);cache.maxOrder=max(cache.maxOrder,key.order);
+      if(hidden)++cache.hiddenCount;else cache.items.push_back({path,key});
+    }
+    ++cache.next;yield();return true;
+  }
+  std::sort(cache.items.begin(),cache.items.end(),[](const CamAlbumItem&a,const CamAlbumItem&b){return camPhotoNewer(a.key,a.path.c_str(),b.key,b.path.c_str());});
+  if(cache.items.size()>CAM_PHOTO_ARCHIVE_LIMIT)cache.items.resize(CAM_PHOTO_ARCHIVE_LIMIT);
+  alignas(4) uint8_t sector[512];if(!SD_MMC.readRAW(sector,0)){cache.building=false;return false;}
+  cache.valid=true;cache.building=false;std::vector<String>().swap(cache.names);return true;
+}
+static bool camScanMedia(const char* folder,const char* extension,std::vector<CamAlbumItem>& result) {
+  const uint32_t started=millis();auto& cache=camMediaIndex(folder);
+  const bool hit=cache.valid && cache.revision==camMediaCacheRevision(cache);
+  if(!hit) {
+    if(!cache.building || cache.revision!=camMediaCacheRevision(cache)) {
+      bool begun=false;for(unsigned attempt=0;attempt<2 && !begun;++attempt){begun=camMediaIndexBegin(folder,extension,cache);if(!begun)delay(30);}
+      if(!begun)return false;
+    }
+    while(cache.building)if(!camMediaIndexStep(cache))return false;
+  }
+  alignas(4) uint8_t sector[512];if(!camSdReady || !SD_MMC.readRAW(sector,0))return false;
+  result=cache.items;
+  Serial.printf("[MEDIA-SCAN] kind=%s files=%u shown=%u stable=1 cache_hit=%d elapsed_ms=%lu\n",folder,unsigned(cache.totalFiles),unsigned(result.size()),hit,(unsigned long)(millis()-started));return true;
+}
 static std::vector<CamAlbumItem> camAlbumItems;
 static size_t camAlbumIndex = 0;
 static uint8_t* camAlbumJpeg = nullptr;
 static size_t camAlbumBytes = 0;
 static uint16_t camAlbumWidth = 0, camAlbumHeight = 0;
+static LGFX_Sprite camAlbumCover(&tft);
+static bool camAlbumCoverReady=false;
+static String camAlbumCoverPath;
+static uint32_t camAlbumCoverRevision=0;
 static String camAlbumError;
+static bool camAlbumScanFailed=false;
 static bool camAlbumClickPending=false;
 static uint32_t camAlbumClickAt=0;
 static String camAlbumDeleteTarget;
@@ -63,6 +154,30 @@ static String camAlbumTimeLabel(const CamPhotoKey& key) {
   return label;
 }
 
+static bool camAlbumCoverMatches(const String& path) {
+  return camAlbumCoverReady && camAlbumCoverRevision==camPhotoIndexRevision && camAlbumCoverPath==path;
+}
+static bool camAlbumMakeCover(const String& path,const uint8_t* jpeg,size_t bytes,uint16_t width,uint16_t height) {
+  camAlbumCover.setPsram(true);camAlbumCover.setColorDepth(16);
+  if(!camAlbumCoverReady)camAlbumCoverReady=camAlbumCover.createSprite(240,192)!=nullptr;
+  if(!camAlbumCoverReady)return false;
+  camAlbumCoverPath="";camAlbumCover.fillScreen(TFT_BLACK);
+  const float scale=min(240.0f/width,192.0f/height);
+  if(!camAlbumCover.drawJpg(jpeg,bytes,(240-int(width*scale))/2,(192-int(height*scale))/2,0,0,0,0,scale,scale))return false;
+  camAlbumCoverPath=path;camAlbumCoverRevision=camPhotoIndexRevision;return true;
+}
+static void camAlbumCoverWarmTick() {
+  static uint32_t retryAt=0;
+  if(uiPage!=UiPage::Page1 || millis()-lastInteractionAt<2000 || (retryAt && millis()-retryAt<10000))return;
+  if(!camPhotoIndexCache.valid || camPhotoIndexCache.revision!=camPhotoIndexRevision || camPhotoIndexCache.items.empty())return;
+  const auto& path=camPhotoIndexCache.items.front().path;if(camAlbumCoverMatches(path))return;
+  retryAt=millis();const uint32_t began=millis();File file=SD_MMC.open(path,FILE_READ);const size_t bytes=file?file.size():0;
+  if(bytes<4 || bytes>CAM_JPEG_MAX_BYTES)return;
+  auto* jpeg=(uint8_t*)heap_caps_malloc(bytes,MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT);if(!jpeg)return;
+  bool ok=file.read(jpeg,bytes)==bytes;file.close();uint16_t w=0,h=0;
+  ok=ok && camAlbumJpegDimensions(jpeg,bytes,w,h) && camAlbumMakeCover(path,jpeg,bytes,w,h);heap_caps_free(jpeg);
+  Serial.printf("[ALBUM-COVER] warm=%d bytes=%u elapsed_ms=%lu\n",ok,unsigned(bytes),(unsigned long)(millis()-began));
+}
 static void camAlbumDraw() {
   if (!camViewReady) return;
   camViewSprite.fillScreen(TFT_BLACK);
@@ -72,13 +187,20 @@ static void camAlbumDraw() {
   camViewSprite.print(uiText("相册 ","Album ","Album ") + String(camAlbumItems.empty() ? 0 : camAlbumIndex+1) + "/" + String(camAlbumItems.size()));
   camViewSprite.setCursor(4, 20);
   camViewSprite.setFont(&fonts::efontCN_12);
-  if (!camAlbumItems.empty()) camViewSprite.print(camAlbumTimeLabel(camAlbumItems[camAlbumIndex].key));
+  if(camAlbumScanFailed)camViewSprite.print(uiText("扫描未完成，B/C重试","Scan incomplete; B/C retry","Scan incomplete; B/C retry"));
+  else if (!camAlbumItems.empty()) camViewSprite.print(camAlbumTimeLabel(camAlbumItems[camAlbumIndex].key));
   if (camAlbumJpeg) {
     const float scale = min(240.0f / camAlbumWidth, 192.0f / camAlbumHeight);
-    camViewSprite.setClipRect(0, 32, 240, 192);
-    camViewSprite.drawJpg(camAlbumJpeg, camAlbumBytes, (240-int(camAlbumWidth*scale))/2,
-        32+(192-int(camAlbumHeight*scale))/2, 0, 0, 0, 0, scale, scale);
-    camViewSprite.clearClipRect();
+    const auto& path=camAlbumItems[camAlbumIndex].path;
+    bool cached=camAlbumCoverMatches(path);
+    if(!cached && camAlbumIndex==0)cached=camAlbumMakeCover(path,camAlbumJpeg,camAlbumBytes,camAlbumWidth,camAlbumHeight);
+    if(cached)camAlbumCover.pushSprite(&camViewSprite,0,32);
+    else {
+      camViewSprite.setClipRect(0,32,240,192);
+      camViewSprite.drawJpg(camAlbumJpeg,camAlbumBytes,(240-int(camAlbumWidth*scale))/2,
+          32+(192-int(camAlbumHeight*scale))/2,0,0,0,0,scale,scale);
+      camViewSprite.clearClipRect();
+    }
   } else {
     camViewSprite.setCursor(4, 104);
     camViewSprite.setFont(&fonts::efontCN_12);
@@ -91,9 +213,10 @@ static void camAlbumDraw() {
 }
 
 static void camAlbumLoad() {
+  const uint32_t began=millis();
   if (camAlbumJpeg) heap_caps_free(camAlbumJpeg);
   camAlbumJpeg = nullptr; camAlbumBytes = 0;
-  camAlbumError = camSdReady ? uiText("暂无照片","No photos","No photos") : uiText("未连接 TF 卡","TF card unavailable","TF card unavailable");
+  camAlbumError = camSdReady ? (camAlbumScanFailed?uiText("相册扫描失败，请重试","Album scan failed; retry","Album scan failed; retry"):uiText("暂无照片","No photos","No photos")) : uiText("未连接 TF 卡","TF card unavailable","TF card unavailable");
   if (camAlbumItems.empty()) { camAlbumDraw(); return; }
   File f = SD_MMC.open(camAlbumItems[camAlbumIndex].path, FILE_READ);
   const size_t n = f ? f.size() : 0;
@@ -110,7 +233,8 @@ static void camAlbumLoad() {
   ok = ok && camAlbumJpegDimensions(camAlbumJpeg, n, camAlbumWidth, camAlbumHeight);
   if (ok) camAlbumBytes = n;
   else { if (camAlbumJpeg) heap_caps_free(camAlbumJpeg); camAlbumJpeg = nullptr; }
-  camAlbumDraw();
+  const uint32_t readDone=millis();camAlbumDraw();
+  Serial.printf("[ALBUM-LOAD] bytes=%u read_ms=%lu draw_ms=%lu total_ms=%lu ok=%d\n",unsigned(camAlbumBytes),(unsigned long)(readDone-began),(unsigned long)(millis()-readDone),(unsigned long)(millis()-began),ok);
 }
 
 static void camAlbumStatus() {
@@ -149,44 +273,51 @@ static void camPhotoOrderAudit() {
 
 static void camOpenAlbum() {
   if (recording || stoppingRecording || asrSessionActive || asrConnected || appState == AppState::Thinking) return;
+  const uint32_t openedAt=millis();
   menuSelectItem(MenuAlbum);
-  camStopPreviewCamera(); camAlbumClear();
+  if(!camAcquireModelTransport())return;
+  camStopPreviewCamera();auto previous=std::move(camAlbumItems);camAlbumClear();
+  camAlbumScanFailed=false;
   camViewSprite.setPsram(true); camViewSprite.setColorDepth(16);
   if (!camViewReady) camViewReady = camViewSprite.createSprite(240, 240) != nullptr;
   if (!camViewReady) { setState(AppState::Error, "Album memory unavailable"); return; }
   if (camSdReady) {
-    File dir = SD_MMC.open("/photo");
-    for (File f = dir.openNextFile(); f; f = dir.openNextFile()) {
-      const String path = f.path();
-      if (!f.isDirectory() && path.endsWith(".jpg")) {
-        CamAlbumItem item{path, camParsePhotoKey(path.c_str(), f.getLastWrite())};
-        auto pos = std::lower_bound(camAlbumItems.begin(), camAlbumItems.end(), item,
-            [](const CamAlbumItem& a, const CamAlbumItem& b) {
-              return camPhotoNewer(a.key, a.path.c_str(), b.key, b.path.c_str());
-            });
-        camAlbumItems.insert(pos, item);
-        if (camAlbumItems.size() > CAM_PHOTO_ARCHIVE_LIMIT) camAlbumItems.pop_back();
-      }
-      f.close(); yield();
+    if(!camScanMedia("/photo",".jpg",camAlbumItems)) {
+      camAlbumScanFailed=true;
+      camAlbumItems=std::move(previous);
+      Serial.println("[ALBUM] incomplete scan; retaining previous index; retry after card check");
     }
-    dir.close();
   }
   ++buttonUiGeneration;
   camPhotoStage = CamPhotoStage::Album; uiPage = UiPage::CameraView;
   camAlbumLoad();
-  Serial.printf("[ALBUM] opened count=%u newest_first=1\n", unsigned(camAlbumItems.size()));
+  Serial.printf("[ALBUM] opened count=%u newest_first=1 total_ms=%lu\n", unsigned(camAlbumItems.size()),(unsigned long)(millis()-openedAt));
 }
 
 static bool camAlbumHandleKey(char key, bool click, bool longPress) {
+  if(camAlbumScanFailed && click && (key=='B' || key=='C')){camOpenAlbum();return true;}
   if (camMediaDelete.active) {
     const auto action = camMediaDelete.action(key, click, longPress);
     if (action == CamMediaDeleteState::Action::Cancel) {
       camMediaDeleteClose(); camAlbumDraw();
+    } else if(action==CamMediaDeleteState::Action::Advance) {
+      ++buttonUiGeneration;camMediaDeleteDraw();
+    } else if(action==CamMediaDeleteState::Action::Hide) {
+      const bool valid=camAlbumIndex<camAlbumItems.size() && camMediaDelete.matches(false,camAlbumIndex,camAlbumItems[camAlbumIndex].path.c_str());
+      if(!valid){camMediaDeleteClose();camAlbumDraw();return true;}
+      if(!camSetPhotoHidden(camMediaDelete.path,true)){camMediaDeleteDraw(true);return true;}
+      Serial.println(String("[ALBUM] hidden original_retained=1 path=")+camMediaDelete.path);
+      camAlbumItems.erase(camAlbumItems.begin()+camAlbumIndex);
+      if(camAlbumIndex>=camAlbumItems.size())camAlbumIndex=camAlbumItems.empty()?0:camAlbumItems.size()-1;
+      camMediaDeleteClose();camAlbumLoad();
     } else if (action == CamMediaDeleteState::Action::Confirm) {
       const bool targetValid = camAlbumIndex < camAlbumItems.size() &&
           camMediaDelete.matches(false, camAlbumIndex, camAlbumItems[camAlbumIndex].path.c_str());
       if (!targetValid) { camMediaDeleteClose(); camAlbumDraw(); return true; }
+      camMediaDeleteDraw(false,true);
       if (!camSdReady || !SD_MMC.remove(camMediaDelete.path)) { camMediaDeleteDraw(true); return true; }
+      SD_MMC.remove(String(camMediaDelete.path)+".meta");
+      camMediaChanged(camMediaDelete.path);camChatThumbInvalidate();
       for (size_t i = camQuestionPhotoCount(); i > 0; --i)
         if (camQuestionPhotoAt(i-1).imagePath == camMediaDelete.path) camRemoveQuestionPhoto(i-1);
       applyChatLayout();
@@ -213,8 +344,8 @@ static bool camAlbumHandleKey(char key, bool click, bool longPress) {
   if (key == 'B' || key == 'C') {
     if (camAlbumItems.empty()) return true;
     size_t next = camAlbumIndex;
-    if (key == 'B' && next+1 < camAlbumItems.size()) ++next;
-    if (key == 'C' && next) --next;
+    if (key == 'B') next=(next+1)%camAlbumItems.size();
+    if (key == 'C') next=(next+camAlbumItems.size()-1)%camAlbumItems.size();
     if (next != camAlbumIndex) { camAlbumIndex = next; camAlbumLoad(); }
     return true;
   }
@@ -247,6 +378,6 @@ static bool camAlbumHandleKey(char key, bool click, bool longPress) {
 static void camAlbumTick() {
   if(!camMediaDelete.active && camPhotoStage==CamPhotoStage::Album && camAlbumClickPending && millis()-camAlbumClickAt>350) {
     camAlbumClickPending=false;
-    if(camAlbumIndex) { --camAlbumIndex; camAlbumLoad(); }
+    if(!camAlbumItems.empty()) { camAlbumIndex=(camAlbumIndex+camAlbumItems.size()-1)%camAlbumItems.size(); camAlbumLoad(); }
   }
 }

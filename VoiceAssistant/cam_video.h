@@ -4,6 +4,7 @@
 #include "cam_video_mic.h"
 static File camVideoFile,camVideoPlayback;
 static String camVideoPart,camVideoLastPath;
+static int64_t camVideoCapturedEpoch=0;
 static uint32_t camVideoStarted=0,camVideoFrames=0,camVideoLargest=0,camVideoLastFrame=0;
 static bool camVideoPreviewOnly=false;
 static uint32_t camVideoAudioBytes=0;
@@ -73,7 +74,7 @@ static void camVideoStop() {
   const bool ok=camSdReady && camFinalizeAvi(camVideoPart,elapsed);
   const String final=camVideoPart.substring(0,camVideoPart.length()-5)+".avi";
   const bool saved=ok && SD_MMC.rename(camVideoPart,final);
-  if(saved)camVideoLastPath=final;
+  if(saved){camVideoLastPath=final;camWriteMediaKey(final,camVideoCapturedEpoch);}
   const bool audioOk=audioWritten && camVideoMic.good();
   camVideoNotice=saved ? (audioOk?uiText("有声录像已保存","Video + audio saved","Video + audio saved"):uiText("录像已保存，音频不完整","Video saved; incomplete audio","Video saved; incomplete audio")) : uiText("保存失败，保留待恢复录像","Save failed; recovery file kept","Save failed; recovery file kept");
   Serial.printf("[VIDEO] stopped saved=%d frames=%lu elapsed_ms=%lu fps_x100=%lu path=%s\n",saved,(unsigned long)camVideoFrames,(unsigned long)elapsed,
@@ -81,7 +82,7 @@ static void camVideoStop() {
   Serial.printf("[VIDEO-AUDIO] ok=%d samples=%lu bytes=%lu ring_overflow=%lu i2s_overflow=%lu read_errors=%lu clips=%lu\n",audioOk,
     (unsigned long)(camVideoAudioBytes/2),(unsigned long)camVideoAudioBytes,(unsigned long)camVideoMic.overflow,(unsigned long)camVideoMic.i2sOverflow,(unsigned long)camVideoMic.readErrors,(unsigned long)camVideoMic.clips);
   if(!camVideoFrames && camSdReady)SD_MMC.remove(camVideoPart); // Only this session's empty file.
-  camStopPreviewCamera();
+  camFrameSize=FRAMESIZE_UXGA; // Keep the initialized sensor for the next preview.
 }
 static void camVideoLeave() {
   camVideoClickPending=false;camVideoDeleteTarget="";camMediaDeleteClose();
@@ -91,44 +92,49 @@ static void camVideoLeave() {
 }
 static void camVideoStart() {
   if(!camPhotoOnly || camPhotoStage!=CamPhotoStage::Preview || !camSdReady)return;
-  cancelServiceProbe();
-  camRefreshSdUsage(true);
+  const uint32_t initStarted=millis();
+  if(!camAcquireModelTransport())return;
+  camRefreshSdUsage(!camSdUsageValid);
+  const uint32_t usageDone=millis();
   if(!camSdUsageValid || camSdTotalBytes-camSdUsedBytes<4*1024*1024) {
     camVideoNotice=uiText("TF空间不足","TF storage full","TF storage full");return;
   }
-  camStopPreviewCamera();camFrameSize=camVideoResolution==0?FRAMESIZE_QVGA:camVideoResolution==2?FRAMESIZE_UXGA:FRAMESIZE_VGA;
+  camFrameSize=camVideoResolution==0?FRAMESIZE_QVGA:camVideoResolution==2?FRAMESIZE_UXGA:FRAMESIZE_VGA;
+  sensor_t* previousSensor=camCameraReady?esp_camera_sensor_get():nullptr;
+  const bool changed=!previousSensor || previousSensor->status.framesize!=camFrameSize;
   String error;
   if(!camInitCamera(error)) { camVideoNotice=uiErrorText(error);return; }
-  for(int i=0;i<2;++i) {camera_fb_t* stale=esp_camera_fb_get();if(stale)esp_camera_fb_return(stale);}
+  sensor_t* sensor=esp_camera_sensor_get();
+  if(!sensor || (sensor->status.framesize!=camFrameSize && sensor->set_framesize(sensor,camFrameSize)!=0)) {
+    camVideoNotice=uiText("录像分辨率设置失败","Video resolution failed","Video resolution failed");return;
+  }
+  // Discard a queued frame only when the actual sensor size changed.
+  if(changed){camera_fb_t* stale=esp_camera_fb_get();if(stale)esp_camera_fb_return(stale);}
+  const uint32_t cameraDone=millis();
   if(!SD_MMC.exists("/video") && !SD_MMC.mkdir("/video"))return;
-  (void)camNextPhotoPath(time(nullptr));
-  File videoDir=SD_MMC.open("/video");
-  for(File f=videoDir.openNextFile();f;f=videoDir.openNextFile()) {
-    String key=f.name();key=key.substring(key.lastIndexOf('/')+1);
-    if(key.startsWith("V") && (key.endsWith(".avi") || key.endsWith(".part"))) {
-      key.setCharAt(0,'P');key=key.substring(0,key.lastIndexOf('.'))+".jpg";
-      camPhotoSequence=max(camPhotoSequence,camParsePhotoKey(key.c_str()).order);
-    }f.close();yield();
-  }videoDir.close();
-  char path[96];const int64_t epoch=time(nullptr);
-  // Shared persisted photo sequence keeps recordings ordered without NTP.
-  do { snprintf(path,sizeof(path),"/video/V%016llx_T%010llu.part",(unsigned long long)++camPhotoSequence,
-      (unsigned long long)(camValidPhotoTime(epoch)?epoch:0)); } while(SD_MMC.exists(path) || SD_MMC.exists(String(path).substring(0,strlen(path)-5)+".avi"));
+  camVideoCapturedEpoch=time(nullptr);
+  const String path=camNextMediaPath("/video","V-",".part",camVideoCapturedEpoch);
+  const uint32_t pathDone=millis();
   camVideoPart=path;camVideoFile=SD_MMC.open(path,FILE_WRITE);
   camVideoWidth=camVideoResolution==0?320:camVideoResolution==2?1600:640;camVideoHeight=camVideoWidth*3/4;
   uint8_t header[CAM_AVI_HEADER];aviHeader(header,camVideoWidth,camVideoHeight,0,100,0,0,false);
   if(!camVideoFile || camVideoFile.write(header,sizeof(header))!=sizeof(header)) { camVideoFile.close();camVideoNotice=uiText("无法写入TF卡","Cannot write TF","Cannot write TF");return; }
   if(!camVideoMic.begin()) {camVideoFile.close();SD_MMC.remove(camVideoPart);camVideoNotice=uiText("麦克风启动失败","Microphone start failed","Microphone start failed");return;}
+  const uint32_t audioDone=millis();
   camVideoFile.flush();camVideoFrames=camVideoLargest=camVideoAudioBytes=0;camVideoStarted=millis();camVideoLastFrame=0;
   camVideoNotice="";camVideoRecording=true;
-  Serial.printf("[VIDEO] started width=%u height=%u audio=PCM16_16k_mono stop_on_B_release=1 path=%s\n",camVideoWidth,camVideoHeight,path);
+  Serial.printf("[VIDEO-START] total_ms=%lu usage_ms=%lu camera_ms=%lu path_ms=%lu file_audio_ms=%lu flush_ms=%lu\n",(unsigned long)(millis()-initStarted),(unsigned long)(usageDone-initStarted),(unsigned long)(cameraDone-usageDone),(unsigned long)(pathDone-cameraDone),(unsigned long)(audioDone-pathDone),(unsigned long)(millis()-audioDone));
+  Serial.printf("[VIDEO] started width=%u height=%u audio=PCM16_16k_mono stop_on_A_click=1 init_ms=%lu path=%s\n",camVideoWidth,camVideoHeight,(unsigned long)(millis()-initStarted),path.c_str());
 }
 static void camVideoDrawOverlay() {
   camViewSprite.fillRect(0,0,240,23,TFT_BLACK);camViewSprite.setFont(&fonts::efontCN_12);camViewSprite.setTextSize(1);
   camViewSprite.setTextColor(TFT_RED,TFT_BLACK);camViewSprite.setCursor(3,3);
   camViewSprite.print(String("REC ")+String((millis()-camVideoStarted)/1000)+"s  "+camVideoSizeText());
   camViewSprite.fillRect(0,217,240,23,TFT_BLACK);camViewSprite.setTextColor(TFT_WHITE,TFT_BLACK);camViewSprite.setCursor(3,221);
-  camViewSprite.print(uiText("松开B结束录像","Release B to stop","Release B to stop"));
+  camViewSprite.print(uiText("A结束录像","A:stop recording","A:stop recording"));
+  const uint32_t elapsed=max<uint32_t>(1,millis()-camVideoStarted);
+  const String fps=String(float(camVideoFrames)*1000.0f/elapsed,1)+" FPS";
+  camViewSprite.setCursor(237-camViewSprite.textWidth(fps),221);camViewSprite.print(fps);
   if(camVideoResolution==2) {camViewSprite.setTextColor(TFT_YELLOW,TFT_BLACK);camViewSprite.setCursor(3,24);camViewSprite.print(uiText("性能受限，帧率可能过低","Limited performance; low FPS","Limited performance; low FPS"));}
   camViewSprite.pushSprite(0,0);
 }
@@ -155,22 +161,15 @@ static bool camVideoLoad(bool autoplay=false) {
 }
 static void camOpenVideos() {
   if(recording || stoppingRecording || asrSessionActive || appState==AppState::Thinking)return;
+  auto previous=std::move(camVideoItems);
   cancelServiceProbe();camVideoLeave();camStopPreviewCamera();camAlbumClear();
   camViewSprite.setPsram(true);camViewSprite.setColorDepth(16);if(!camViewReady)camViewReady=camViewSprite.createSprite(240,240)!=nullptr;
   if(!camViewReady)return;
   menuSelectItem(MenuVideos);camVideoIndex=0;
   if(camSdReady) {
-    File dir=SD_MMC.open("/video");
-    for(File f=dir.openNextFile();f;f=dir.openNextFile()) {
-      String path=f.path();
-      if(!f.isDirectory() && path.endsWith(".avi")) {
-        String key=path.substring(path.lastIndexOf('/')+1);key.setCharAt(0,'P');key=key.substring(0,key.length()-4)+".jpg";
-        CamAlbumItem item{path,camParsePhotoKey(key.c_str(),f.getLastWrite())};
-        auto pos=std::lower_bound(camVideoItems.begin(),camVideoItems.end(),item,[](const CamAlbumItem&a,const CamAlbumItem&b){return camPhotoNewer(a.key,a.path.c_str(),b.key,b.path.c_str());});
-        camVideoItems.insert(pos,item);if(camVideoItems.size()>200)camVideoItems.pop_back();
-      }
-      f.close();yield();
-    }dir.close();
+    if(!camScanMedia("/video",".avi",camVideoItems)) {
+      camVideoItems=std::move(previous);Serial.println("[VIDEOS] incomplete scan; previous index retained");
+    }
   }
   ++buttonUiGeneration;camPhotoStage=CamPhotoStage::VideoAlbum;uiPage=UiPage::CameraView;
   camVideoLibraryDraw();camViewSprite.pushSprite(0,0);
@@ -187,9 +186,11 @@ static bool camVideoHandleKey(char key,bool click,bool longPress,bool released) 
         const bool targetValid=camVideoIndex<camVideoItems.size() &&
             camMediaDelete.matches(true,camVideoIndex,camVideoItems[camVideoIndex].path.c_str());
         if(!targetValid) {camMediaDeleteClose();camVideoLibraryDraw();camViewSprite.pushSprite(0,0);camVideoLoad();return true;}
+        camMediaDeleteDraw(false,true);
         if(!camSdReady || !SD_MMC.remove(camMediaDelete.path)) {camMediaDeleteDraw(true);return true;}
+        SD_MMC.remove(String(camMediaDelete.path)+".meta");
         Serial.println(String("[VIDEOS] deleted ")+camMediaDelete.path);
-        camVideoItems.erase(camVideoItems.begin()+camVideoIndex);
+        camMediaChanged(camMediaDelete.path);camVideoItems.erase(camVideoItems.begin()+camVideoIndex);
         if(camVideoIndex>=camVideoItems.size())camVideoIndex=camVideoItems.empty()?0:camVideoItems.size()-1;
         camMediaDeleteClose();camVideoLibraryDraw();camViewSprite.pushSprite(0,0);camVideoLoad();
       }
@@ -206,10 +207,10 @@ static bool camVideoHandleKey(char key,bool click,bool longPress,bool released) 
     }
     camVideoClickPending=false;
     if(key=='A') {if(!camVideoPlayback || camVideoPlayback.position()>=camVideoPlayEnd)camVideoLoad(true);else {camVideoPlaying=!camVideoPlaying;camVideoPreviewOnly=false;camVideoPlayAt=millis();}}
-    else if(key=='B' && !camVideoItems.empty()) {if(camVideoIndex+1<camVideoItems.size())++camVideoIndex;camVideoLoad();}
+    else if(key=='B' && !camVideoItems.empty()) {camVideoIndex=(camVideoIndex+1)%camVideoItems.size();camVideoLoad();}
     return true;
   }
-  if(camVideoRecording) { if(key=='B' && released)camVideoStop();else if(key=='A' && longPress){camVideoStop();camClosePhotoUi(true);}return true; }
+  if(camVideoRecording) { if(key=='A' && click)camVideoStop();else if(key=='A' && longPress){camVideoStop();camClosePhotoUi(true);}return true; }
   if(camPhotoOnly && camPhotoStage==CamPhotoStage::Preview && key=='B' && longPress) {camVideoStart();return true;}
   return false;
 }
@@ -217,7 +218,7 @@ static void camVideoTick() {
   if(camPhotoStage==CamPhotoStage::VideoAlbum && camMediaDelete.active)return;
   if(camPhotoStage==CamPhotoStage::VideoAlbum && camVideoClickPending && millis()-camVideoClickAt>350) {
     camVideoClickPending=false;
-    if(camVideoIndex) {--camVideoIndex;camVideoLoad();}
+    if(!camVideoItems.empty()) {camVideoIndex=(camVideoIndex+camVideoItems.size()-1)%camVideoItems.size();camVideoLoad();}
   }
   if(camVideoRecording) {
     if(!camVideoMic.running || !camVideoDrainAudio()) {camVideoStop();return;}
@@ -232,7 +233,7 @@ static void camVideoTick() {
     if(ok && (frame->len&1)) {const uint8_t zero=0;ok=camVideoFile.write(&zero,1)==1;}
     if(ok) {++camVideoFrames;camVideoLargest=max<uint32_t>(camVideoLargest,frame->len);}
     // Preview decoding is limited to 2 Hz so SD capture gets the other frames.
-    if(ok && (camVideoFrames==1 || millis()-camPreviewLastAt>=500)) {camDrawPhotoView(frame->buf,frame->len,frame->width,frame->height);camVideoDrawOverlay();camPreviewLastAt=millis();}
+    if(ok && (camVideoFrames==1 || millis()-camPreviewLastAt>=500)) {camDrawPhotoView(frame->buf,frame->len,frame->width,frame->height,false);camVideoDrawOverlay();camPreviewLastAt=millis();}
     esp_camera_fb_return(frame);
     if(!ok) {camVideoStop();camVideoNotice=uiText("TF写入失败，录像已结束","TF write failed; stopped","TF write failed; stopped");}
     else if(camVideoFrames%8==0)camVideoFile.flush();

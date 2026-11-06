@@ -13,7 +13,7 @@ parser.add_argument('--output',type=Path,default=root/'validation/20261031-v047'
 out=parser.parse_args().output.resolve()
 out.mkdir(parents=True, exist_ok=True)
 host = root / '.build-host'
-compiler = host_compiler()
+host.mkdir(exist_ok=True)
 env = os.environ.copy()
 for key, folder in [('TEMP', 'tmp'), ('TMP', 'tmp'),
                     ('ZIG_GLOBAL_CACHE_DIR', 'global-cache'),
@@ -40,6 +40,7 @@ static fs::FS SD_MMC;
 '''
 (out/'cam_queue_under_test.h').write_text(prefix+photo+queue_globals+helpers, encoding='utf-8')
 main = (root/'VoiceAssistant/VoiceAssistant.ino').read_text(encoding='utf-8')
+(out/'cam_psram_under_test.h').write_text('class PsramString {'+main.split('class PsramString {',1)[1].split('// JPEG bytes remain',1)[0],encoding='utf-8')
 record_route = main.split('static void startRecording() {',1)[1].split('  if(usesIatV2()) {',1)[0]
 ask_route = main.split('static bool askAndStoreChat(String question, bool forceSearch) {',1)[1].split('  transientSearchResult = "";',1)[0]
 routes = '''
@@ -58,7 +59,7 @@ static bool camAskAndStoreVision(const String&){++visionCalls;return true;}
 routes += 'static void probeRecordingRoute(){'+record_route+'modePath=3;}\n'
 routes += 'static bool probeAskRoute(String question){'+ask_route+'return false;}\n'
 (out/'cam_mode_routes_under_test.h').write_text(routes, encoding='utf-8')
-subprocess.run([*compiler, '-std=c++17', '-I', str(tests), '-I', str(out), '-I', str(root/'VoiceAssistant'),
+subprocess.run([*host_compiler(), '-std=c++17', '-I', str(tests), '-I', str(out), '-I', str(root/'VoiceAssistant'),
                 str(tests/'test_cam_offline.cpp'), '-o', str(exe)], env=env, check=True)
 vectors = out / 'stream-vectors.txt'
 run = subprocess.run([str(exe), str(vectors)], capture_output=True, text=True, check=True)
@@ -84,7 +85,7 @@ sink = main.split('class LlmSseSink : public Stream {', 1)[1].split('// Determin
 (out/'cam_sse_under_test.h').write_text('class LlmSseSink : public Stream {'+sink, encoding='utf-8')
 json_include = arduinojson_include()
 context_exe = out/'context-stream-tests.exe'
-subprocess.run([*compiler, '-std=c++17', '-I', str(tests), '-I', str(out), '-I', str(root/'VoiceAssistant'),
+subprocess.run([*host_compiler(), '-std=c++17', '-I', str(tests), '-I', str(out), '-I', str(root/'VoiceAssistant'),
                 '-I', str(json_include), str(tests/'test_cam_context_stream.cpp'), '-o', str(context_exe)], env=env, check=True)
 context_vectors = out/'context-vectors.txt'
 context_run = subprocess.run([str(context_exe), str(context_vectors)], capture_output=True, text=True, check=True)
@@ -111,7 +112,8 @@ report = dict(hardware_tested=False, flashed=False, native_delete_state_pass=Tru
               context_round_trip_and_message_image_order_pass=True, context_json_vectors=len(context_lines),
               reasoning_parser_stress_input_bytes=1500*1024, live_layout_input_max_bytes=771,
               inline_think_parser_stress_input_bytes=1000*1024,
-              reasoning_retained_max_bytes=8192, visible_reply_limit_bytes=49152,
+              live_reasoning_window_max_bytes=8192, reasoning_archive_max_bytes=65536,
+              folded_reasoning_restored_after_completion_tested=True,visible_reply_limit_bytes=49152,
               real_device_ui_timing_tested=False)
 (out/'offline-tests.json').write_text(json.dumps(report, indent=2)+'\n', encoding='utf-8')
 print(json.dumps(report, indent=2))

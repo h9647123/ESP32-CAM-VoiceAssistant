@@ -3,6 +3,8 @@
 #define ARDUINOJSON_ENABLE_ARDUINO_PRINT 0
 #define ARDUINOJSON_ENABLE_PROGMEM 0
 #include "Arduino.h"
+#include "cam_rich_state.h"
+#include "cam_stream_reveal.h"
 #include <ArduinoJson.h>
 #include "cam_jpeg_stream.h"
 #include "cam_vision_policy.h"
@@ -10,7 +12,14 @@
 #include <iostream>
 #include <fstream>
 #include "cam_queue_under_test.h"
-using PsramString=String;
+struct SerialMock {template<class... Args>void printf(const char*,Args...){} void println(const char*){}} Serial;
+static constexpr unsigned MALLOC_CAP_SPIRAM=1,MALLOC_CAP_8BIT=2;
+static bool psramFound(){return true;}
+static void* heap_caps_malloc(size_t n,unsigned){return malloc(n);}
+#include "cam_psram_under_test.h"
+struct HostJsonAllocator:ArduinoJson::Allocator {
+ void* allocate(size_t n)override{return malloc(n);}void deallocate(void*p)override{free(p);}void* reallocate(void*p,size_t n)override{return realloc(p,n);}
+}camJsonAllocator;
 #include "cam_context_under_test.h"
 static String lastError,camVisionDetail="low";
 struct Config {bool enableThinking=true,showThinking=true,clockMode=false;size_t llmContextMaxBytes=8192;} cfg;
@@ -24,11 +33,17 @@ static String buildLlmRequestBodyBudget(size_t assistantIndex,bool stream,const 
 }
 #include "cam_vision_parts_under_test.h"
 static uint32_t millis(){static uint32_t now=0;return ++now;}
+static void delay(unsigned){}static void yield(){}
+static bool camStreamRevealSkipRequested=false,chatStreamRendering=false;
+static int32_t chatScrollPixels=0,chatScrollTargetPixels=0;
+static bool camPollVisionCancel(){return false;}
+// Formatter boundaries are exercised by test-v0417-render.py; this fixture
+// isolates long transport/parser ownership and presentation-buffer bounds.
+static size_t camStreamSafePrefix(const String&,size_t desired,bool){return desired;}
 static String uiText(const char* cn,const char*,const char*){return cn;}
-struct SerialMock {template<class... Args>void printf(const char*,Args...){} void println(const char*){}} Serial;
 struct EspMock {int getFreeHeap(){return 100000;}} ESP;
 static constexpr size_t LLM_FALLBACK_CAPTURE_BYTES=32768,LLM_SSE_LINE_MAX_BYTES=32768,LLM_VISIBLE_REPLY_MAX_BYTES=49152;
-static constexpr char RICH_THINKING_TOGGLE=3;
+static constexpr char RICH_THINKING_TOGGLE=3,RICH_LITERAL_ESCAPE=5;
 enum class UiPage {Page1};static UiPage uiPage=UiPage::Page1;
 static bool screenSleeping=false,chatLinesDirty=true,chatAutoScrollBottom=false;
 static std::vector<String> chatLines;static std::vector<uint8_t> chatLineRoles;
@@ -39,6 +54,7 @@ static void tickLlmWaitingAnimation(bool){}
 static void drawPage1TopLine(){}
 static void drawChatWindow(bool){}
 static void drawPage1Footer(const String&){}
+static void camShowLlmPhase(unsigned,uint32_t){}
 static void updateChatMessageContent(size_t i,const String& content,bool=true){if(i<chatHistory.size())chatHistory[i].content=content;}
 static String truncateUtf8ToBytes(const String& text,size_t count){count=min(count,text.length());while(count<text.length()&&count&&(uint8_t(text[count])&0xc0)==0x80)--count;return text.substring(0,count);}
 #include "cam_think_helpers_under_test.h"
@@ -69,8 +85,8 @@ int main(int argc,char**argv){
  }
  // Current unsaved photo may stream from RAM; a later follow-up cannot invent
  // its pixels after RAM is released. It remains an explicit unavailable ref.
- {uint8_t jpeg[]={1,2,3};camPhoto.jpeg=jpeg;camPhoto.size=3;camPhoto.confirmed=true;
-  chatHistory={{"user","temporary photo",{{"",3}}},{"assistant","",{}}};
+ {uint8_t jpeg[]={1,2,3};camPhoto.jpeg=jpeg;camPhoto.size=3;camPhoto.confirmed=true;camPhoto.generation=42;
+  chatHistory={{"user","temporary photo",{{"",3,42}}},{"assistant","",{}}};
   String parts[7];CamJpegSource sources[6];size_t count=0;
   assert(camBuildVisionParts(1,true,parts,sources,count));assert(count==1);assert(sources[0].jpeg==jpeg);
   camPhoto.jpeg=nullptr;camReleasePhoto();chatHistory.push_back({"user","follow-up",{}});chatHistory.push_back({"assistant","",{}});
@@ -79,7 +95,9 @@ int main(int argc,char**argv){
  chatHistory={{"user","long reasoning",{}},{"assistant","",{}}};chatLinesDirty=true;
  {LlmSseSink sink(1);for(int i=0;i<1500;++i){feed(sink,"reasoning_content",String(std::string(1024,'r')));assert(sink.answer().size()<=8192);assert(!sink.failed());}
   feed(sink,"content","最终答案：a∈(-∞,-1]。\n");const char* done="data: {\"choices\":[{\"finish_reason\":\"stop\"}]}\n\n";sink.write((const uint8_t*)done,strlen(done));sink.finish();assert(sink.done());assert(!sink.truncated());assert(!sink.failed());assert(sink.answer().find("最终答案")!=String::npos);assert(maxTailBytes<=771);}
- {cfg.showThinking=false;LlmSseSink sink(1);for(int i=0;i<100;++i)feed(sink,"reasoning_content",String(std::string(1024,'r')));assert(sink.answer().empty());feed(sink,"content","Final");sink.finish();assert(sink.answer()=="Final");}
+ {cfg.showThinking=false;LlmSseSink sink(1);for(int i=0;i<100;++i)feed(sink,"reasoning_content",String(std::string(1024,'r')));assert(sink.answer().empty());feed(sink,"content","Final");sink.finish();assert(sink.answer()=="Final");assert(chatHistory[1].thinkingTimed&&chatHistory[1].thinkingComplete&&chatHistory[1].thinkingMs>0);}
+ {cfg.showThinking=true;LlmSseSink sink(1);for(int i=0;i<20;++i)feed(sink,"reasoning_content",String(i)+":"+String(std::string(512,'r'))+"\n");
+  feed(sink,"content","Final after 20 segments");sink.finish();assert(sink.answer().indexOf("0:")>=0&&sink.answer().indexOf("19:")>=0&&sink.answer().indexOf("Final after")>=0);}
  {cfg.showThinking=true;LlmSseSink sink(1);for(int i=0;i<800&&!sink.done();++i)feed(sink,"content",String(std::string(128,'x')));assert(sink.done());assert(sink.outputLimited());assert(sink.answer().length()<=49152);}
  {LlmSseSink sink(1);feed(sink,"content","<think>");for(int i=0;i<1000;++i){feed(sink,"content",String(std::string(1024,'t')));assert(sink.answer().length()<=8192);assert(!sink.truncated());}
   feed(sink,"content","</think>Final answer after inline reasoning.");sink.finish();assert(!sink.truncated());assert(sink.answer().find("Final answer after inline reasoning.")!=String::npos);}

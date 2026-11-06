@@ -3,7 +3,7 @@ from host_toolchain import host_compiler, arduinojson_include
 from pathlib import Path
 import json,os,subprocess
 root=Path(__file__).resolve().parents[1]
-out=root/'validation/20261031-v0412';out.mkdir(parents=True,exist_ok=True)
+out=Path(os.environ.get("CAM_TEST_OUTPUT", str(root/"validation/20261031-v0412")));out.mkdir(parents=True,exist_ok=True)
 source=(root/'VoiceAssistant/VoiceAssistant.ino').read_text(encoding='utf-8')
 storage=(root/'VoiceAssistant/cam_chat_storage.h').read_text(encoding='utf-8')
 transaction='static bool chatRecoverFile('+storage.split('static bool chatRecoverFile(',1)[1]
@@ -86,7 +86,7 @@ native=native.replace('int main(){',fixture+guard+'''int main(){
  camModelCapabilities.clear();
 ''')
 test=out/'storage-model-test.cpp';test.write_text(native,encoding='utf-8')
-host=root/'.build-host';env=os.environ.copy()
+host=root/'.build-host';host.mkdir(exist_ok=True);env=os.environ.copy()
 for key,folder in [('TEMP','tmp'),('TMP','tmp'),('ZIG_GLOBAL_CACHE_DIR','global-cache'),('ZIG_LOCAL_CACHE_DIR','local-cache')]:(host/folder).mkdir(parents=True,exist_ok=True);env[key]=str(host/folder)
 exe=out/'storage-model-test.exe'
 subprocess.run([*host_compiler(),'-std=c++17','-I',str(root/'tools/host-tests'),'-I',str(root/'VoiceAssistant'),'-I',str(arduinojson_include()),str(test),'-o',str(exe)],env=env,check=True)

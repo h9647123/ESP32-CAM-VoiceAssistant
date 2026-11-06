@@ -53,6 +53,7 @@ static bool chatCommitFile(fs::FS& store,const String& path) {
     if (hadOriginal) store.rename(backup,path);
     return false;
   }
-  if (hadOriginal) store.remove(backup);
+  // Retain the previous committed generation for diagnosis/recovery. It is
+  // replaced only when the next complete temporary file is ready to commit.
   return true;
 }

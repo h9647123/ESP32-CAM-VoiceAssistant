@@ -29,3 +29,9 @@ build-cam.ps1 / build-cam-probe.ps1 只编译，不自动烧录。capture-cam-cr
 历史镜像校验工具依赖开发机私有回退和原分区快照，不作为公共通用脚本发布；不要用公开仓库测试替代实际设备身份、分区和备份检查。
 
 公开 CRC 离线测试仅使用生成样图和协议负例；若未提供原开发机历史坏图，会显式以 historical_bad_frames=0 记录，不将它说成重跑了历史 12 张。运行：`python tools/test-cam-crc-offline.py --output validation/new-empty-crc-test`。
+
+## v0.4.26 新增回归
+
+相同环境变量运行 `test-v0415-web.py`（有界搜索、历史保存和严格 JSON）、`test-v0416-thumbs.py`（三图布局）、`test-v0417-render.py`（公式围栏/差商/角标）、`test-stream-reveal.py`（UTF-8 逐字）、`test-stream-bottom.py`（当帧贴底）、`test-media-index.py`（索引失效/失败/隐藏排序）。主机测试均不打开串口，也不向真实服务请求。
+
+`capture-chat-screen.py --port <核实后的串口> --command "ui screenshot" --output screen.png` 可获取板端绘制缓冲，需要 pyserial/Pillow。截图可能含个人对话或照片，请自行留在本地。

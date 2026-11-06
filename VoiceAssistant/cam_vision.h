@@ -4,6 +4,7 @@
 #include "cam_jpeg_stream.h"
 #include "cam_tls.h"
 #include "cam_vision_policy.h"
+#include "cam_json_memory.h"
 
 static bool camOtherModelAllowed = false;
 static String camVisionDetail = "low";
@@ -32,7 +33,7 @@ static bool camBuildVisionParts(size_t assistantIndex, bool stream, String* part
   String body = buildLlmRequestBodyBudget(assistantIndex, stream, "",
       min<size_t>(cfg.llmContextMaxBytes, 8192),true);
   if (!body.length()) { lastError = "Vision context allocation failed"; return false; }
-  JsonDocument req;
+  JsonDocument req(&camJsonAllocator);
   if (deserializeJson(req, body)) { lastError = "Vision JSON allocation failed"; return false; }
   body = "";
   JsonArray messages=req["messages"].as<JsonArray>();
@@ -65,7 +66,8 @@ static bool camBuildVisionParts(size_t assistantIndex, bool stream, String* part
       sources[count].path=reference.path;sources[count].size=reference.bytes;
       if(index==currentUserIndex && j<camQuestionPhotoCount()) {
         const auto& photo=camQuestionPhotoAt(j);
-        if(photo.imagePath==reference.path && photo.size==reference.bytes)sources[count].jpeg=photo.jpeg;
+        if(photo.imagePath==reference.path && photo.size==reference.bytes &&
+            (reference.path.length() || (reference.generation && reference.generation==photo.generation)))sources[count].jpeg=photo.jpeg;
       }
       JsonObject image=content.add<JsonObject>();image["type"] = "image_url";
       image["image_url"]["url"]="__CAM_JPEG_STREAM_01A0F6BF_"+String(count)+"__";
@@ -96,6 +98,12 @@ static bool camBuildVisionParts(size_t assistantIndex, bool stream, String* part
 
 static bool camVisionOnce(size_t assistantIndex, bool stream, bool& retryable) {
   retryable = false;
+  bufferedMic.release();
+  if(camCameraReady){esp_camera_deinit();camCameraReady=false;}
+  camPrintMemory("vision request prepare");
+  if(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL)<24576) {
+    lastError=uiText("连续内存不足，已保留草稿，请退出预览后重试","Contiguous memory low; draft retained, close preview and retry","Contiguous memory low; draft retained, close preview and retry");return false;
+  }
   if (!camPhoto.ready() && !camHasImageContext()) { lastError = "No CAM image context"; return false; }
   size_t count=0;
   String parts[CAM_CONTEXT_IMAGE_LIMIT+1];
@@ -110,13 +118,14 @@ static bool camVisionOnce(size_t assistantIndex, bool stream, bool& retryable) {
       if(!valid){lastError=uiText("历史图片缺失，请检查TF卡或新建会话","Context photo unavailable; check TF or start a new chat","Context photo unavailable; check TF or start a new chat");return false;}
     }
   }
-  CamMultiJpegRequestStream upload(parts,sources,count,SD_MMC);
+  CamMultiJpegRequestStream upload(parts,sources,count,SD_MMC,camUploadCancelled);
   if(upload.failed()){lastError="Invalid image request size";return false;}
   WiFiClientSecure client;
   if (!camConfigureTls(client)) {
     lastError = "NTP required for verified TLS"; return false;
   }
   client.setTimeout(8);
+  client.setHandshakeTimeout(8);
   HTTPClient http;
   http.setTimeout(min<uint32_t>(60000,LLM_STREAM_IDLE_TIMEOUT_MS));
   http.setConnectTimeout(ASR_CONNECT_TIMEOUT_MS);
@@ -135,27 +144,29 @@ static bool camVisionOnce(size_t assistantIndex, bool stream, bool& retryable) {
   const uint32_t started = millis();
   Serial.printf("[CAM-VISION] model=%s stream=%d images=%u JPEG=%u request=%u detail=%s\n",
       cfg.llmModelId.c_str(), stream, unsigned(count), unsigned(jpegBytes), unsigned(upload.size()), camVisionDetail.c_str());
-  const int code = http.sendRequest("POST", &upload, upload.size());
+  const int code = camRunHttpWithUi([&](){return http.sendRequest("POST", &upload, upload.size());},true);
   if (upload.failed()) {
-    http.end(); lastError = "JPEG source read failed"; return false;
+    http.end(); lastError = camVisionCancelRequested?uiText("已取消，草稿已保留","Cancelled; draft retained","Cancelled; draft retained"):uiText("图片读取失败，请检查TF卡","JPEG source read failed; check TF","JPEG source read failed; check TF"); return false;
   }
   if (code < 200 || code >= 300) {
     // Do not capture arbitrary response bodies; error pages can be very large.
+    char tlsError[128]={};const int tlsCode=client.lastError(tlsError,sizeof(tlsError));
+    Serial.printf("[CAM-VISION-TRANSPORT] http=%d tls=%d elapsed_ms=%lu internal=%u largest=%u\n",code,tlsCode,(unsigned long)(millis()-started),unsigned(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)),unsigned(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL)));
     http.end();
     lastError = "Vision HTTP " + String(code);
     retryable = code < 0 || code == 429 || code >= 500;
     Serial.println("[CAM-VISION] " + lastError);
     return false;
   }
-  std::unique_ptr<LlmSseSink> sinkOwner(new(std::nothrow)LlmSseSink(assistantIndex));
+  std::unique_ptr<LlmSseSink> sinkOwner(new(std::nothrow)LlmSseSink(assistantIndex,started));
   if(!sinkOwner){http.end();lastError="Vision stream memory unavailable";return false;}
   LlmSseSink& sink=*sinkOwner;
   const uint32_t spent=millis()-camVisionRequestStarted;
   if(spent>=LLM_STREAM_TOTAL_TIMEOUT_MS){http.end();lastError="Vision request deadline reached";return false;}
   const uint32_t remaining=LLM_STREAM_TOTAL_TIMEOUT_MS-spent;
   const int result = readLlmBodyToSink(http, sink, min<uint32_t>(LLM_STREAM_IDLE_TIMEOUT_MS,remaining), remaining);
+  http.end(); // TLS owns large contiguous buffers; free them before final layout.
   sink.finish();
-  http.end();
   if(camVisionCancelRequested) {lastError=uiText("已取消，图片保留供重试","Cancelled; photos kept for retry","Cancelled; photos kept for retry");return false;}
   if(sink.outputLimited()) {lastError=uiText("回复达到上限，请缩小问题范围","Reply limit reached; narrow the question","Reply limit reached; narrow the question");return false;}
   if (result < 0 || sink.failed() || sink.truncated() || (sink.sawSse() && !sink.done())) {
@@ -190,6 +201,9 @@ static bool camVisionOnce(size_t assistantIndex, bool stream, bool& retryable) {
 }
 
 static bool camAskAndStoreVision(String question) {
+  if(chatHistoryReadIncomplete) {
+    setState(AppState::Error,uiText("会话读取不完整，原文件已保护，请切换会话并备份检查","Incomplete chat load; original protected, switch chat and inspect backup","Incomplete chat load; original protected, switch chat and inspect backup"));return false;
+  }
   if (chatSessionOnTf() && !chatStorageReady()) {setState(AppState::Error,lastError);return false;}
   if (camQuestionRequiresPhoto && (!camPhoto.ready() || !camPhoto.confirmed)) {
     lastError = "Photo missing; retake or cancel the image question";
@@ -201,6 +215,7 @@ static bool camAskAndStoreVision(String question) {
     lastError = "Empty image question";
     setState(AppState::Error, lastError); return false;
   }
+  if(!camAcquireModelTransport()){lastFailedQuestion=question;setState(AppState::Error,lastError);return false;}
   if (!camCheckVisionConfig() || !connectWifi()) {
     lastFailedQuestion = question;
     lastFailedUseSearch = false;
@@ -214,8 +229,8 @@ static bool camAskAndStoreVision(String question) {
   }
   lastError = "";
   composingQuestion = false;
-  pendingQuestion = "";
-  pendingSegments.clear();
+  // Hide the draft while sending; retain it until success so cancel/retry never
+  // destroys a user's independently recorded voice segments.
   transcript = asrBestTranscript = asrStableTranscript = asrPartialTranscript = "";
   const bool retrySame = lastFailedQuestion == question && !chatHistory.empty() &&
       chatHistory.back().role == "user" && String(chatHistory.back().content) == question;
@@ -223,7 +238,7 @@ static bool camAskAndStoreVision(String question) {
   if(camQuestionPhotoCount() && !chatHistory.empty() && chatHistory.back().role=="user") {
     auto& references=chatHistory.back().images;references.clear();
     for(size_t i=0;i<camQuestionPhotoCount();++i) {
-      const auto& photo=camQuestionPhotoAt(i);references.push_back({photo.imagePath,photo.size});
+      const auto& photo=camQuestionPhotoAt(i);references.push_back({photo.imagePath,photo.size,photo.generation});
     }
   }
   addChatMessage("assistant", "", false);
@@ -272,6 +287,7 @@ static bool camAskAndStoreVision(String question) {
     saveChatHistory();
     lastFailedQuestion = question;
     lastFailedUseSearch = false;
+    composingQuestion=pendingQuestion.length()>0;
     setState(AppState::Error, lastError);
     return false; // Keep PSRAM JPEG + question for A/cam retry.
   }
@@ -279,11 +295,13 @@ static bool camAskAndStoreVision(String question) {
   camAppendHistory(cfg.currentSession, "assistant", answer, cfg.llmProviderName,
       cfg.llmModelId, "complete", imagePath);
   camReleasePhoto();
+  pendingQuestion="";pendingSegments.clear();
   // Album chat can continue with voice while the global capture-only mode stays on.
   camQuestionReadyForVoice=camPhotoOnly && camHasImageContext();
   lastError = lastFailedQuestion = "";
   lastFailedUseSearch = false;
   saveChatHistory();
+  camPrintAssistantReply(answer);
   paginate(answer);
   chatScroll = SIZE_MAX;
   showPage();

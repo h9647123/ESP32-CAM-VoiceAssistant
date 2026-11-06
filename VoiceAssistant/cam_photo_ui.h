@@ -28,7 +28,7 @@ static void camStopPreviewCamera() {
   if (camCameraReady) { esp_camera_deinit(); camCameraReady = false; }
 }
 
-static void camDrawPhotoView(const uint8_t* jpeg, size_t size, int width, int height) {
+static void camDrawPhotoView(const uint8_t* jpeg, size_t size, int width, int height, bool present = true) {
   if (!camViewReady) return;
   camViewSprite.fillScreen(TFT_BLACK);
   const bool preview = camPhotoStage == CamPhotoStage::Preview;
@@ -42,7 +42,7 @@ static void camDrawPhotoView(const uint8_t* jpeg, size_t size, int width, int he
         viewTop+(viewHeight-int(height*scale))/2, 0, 0, 0, 0, scale, scale);
     camViewSprite.clearClipRect();
   }
-  if (preview && !camFullPreview) {
+  if (preview && !camFullPreview && !camVideoRecording && !camVideoNotice.length()) {
     camViewSprite.fillRect(0, 0, 240, 23, TFT_BLACK);
     camViewSprite.setFont(&fonts::efontCN_16);
     camViewSprite.setTextColor(TFT_YELLOW, TFT_BLACK);
@@ -55,15 +55,20 @@ static void camDrawPhotoView(const uint8_t* jpeg, size_t size, int width, int he
     camViewSprite.setCursor(4, 4);
     camViewSprite.print(uiText("确认照片","Use this photo?","Use this photo?"));
   }
-  camViewSprite.setFont(camPhotoOnly ? &fonts::efontCN_12 : &fonts::efontCN_16);
+  camViewSprite.setFont(&fonts::efontCN_12);
   camViewSprite.setCursor(3, 220);
   camViewSprite.print(preview ? (camPhotoOnly ? uiText("A拍 长B录 长A菜单","A:shot Hold B:rec A:back","A:shot Hold B:rec A:back") : (camPreviewZoom ? uiText("A拍照 B缩小 C退出","A:shot B:- C:exit","A:shot B:- C:exit") : uiText("A拍照 B放大 C退出","A:shot B:+ C:exit","A:shot B:+ C:exit"))) : (camPhotoOnly ? uiText("A保存 B重拍 C取消","A:save B:retake C:back","A:save B:retake C:back") : uiText("A选用 B重拍 C取消","A:use B:retake C:back","A:use B:retake C:back")));
-  if (preview) {
+  if (preview && !camVideoRecording) {
     const String fps = camFpsWindowAt ? String(camFpsTenths / 10.0f, 1) + " FPS" : "-- FPS";
     camViewSprite.setCursor(237 - camViewSprite.textWidth(fps), 220);
     camViewSprite.print(fps);
   }
-  camViewSprite.pushSprite(0, 0);
+  if(preview && camVideoNotice.length() && !camVideoRecording) {
+    camViewSprite.fillRect(0,0,240,23,TFT_BLACK);camViewSprite.setFont(&fonts::efontCN_12);
+    camViewSprite.setTextColor(TFT_YELLOW,TFT_BLACK);camViewSprite.setCursor(3,4);
+    camViewSprite.print(camVideoNotice);
+  }
+  if(present)camViewSprite.pushSprite(0, 0);
 }
 
 static void camClosePhotoUi(bool toMenu) {
@@ -82,7 +87,7 @@ static void camClosePhotoUi(bool toMenu) {
 }
 
 static void camOpenPreview() {
-  cancelServiceProbe();
+  if(!camAcquireModelTransport())return;
   camVideoNotice="";
   if (!buttonEvents) { setState(AppState::Error, "Button sampler unavailable"); return; }
   if (recording || stoppingRecording || asrSessionActive || asrConnected || composingQuestion) return;
@@ -113,6 +118,7 @@ static void camPreviewTick() {
   camPreviewLastAt = millis();
   String error;
   if (!camInitCamera(error)) {
+    Serial.println("[CAM-PREVIEW-ERROR] "+error);camPrintMemory("preview failed");
     lastError = error; camPreviewErrors++;
     camClosePhotoUi(); setState(AppState::Error, error); return;
   }
@@ -125,11 +131,6 @@ static void camPreviewTick() {
   camera_fb_t* frame = esp_camera_fb_get();
   if (frame) {
     camDrawPhotoView(frame->buf, frame->len, frame->width, frame->height);
-    if(camVideoNotice.length()) {
-      camViewSprite.fillRect(0,24,240,20,TFT_BLACK);camViewSprite.setFont(&fonts::efontCN_12);
-      camViewSprite.setTextColor(TFT_YELLOW,TFT_BLACK);camViewSprite.setCursor(3,26);
-      camViewSprite.print(camVideoNotice);camViewSprite.pushSprite(0,0);
-    }
     esp_camera_fb_return(frame); camPreviewFrames++;
     const uint32_t now = millis();
     if (!camFpsWindowAt) camFpsWindowAt = now;
@@ -204,7 +205,7 @@ static bool camPhotoHandleKey(char key, bool click, bool longPress) {
     camDrawShutterHint();
     camFrameSize = FRAMESIZE_UXGA;
     String error;
-    if (!camCapture(error, false)) {
+    if (!camCapture(error, true)) {
       if(camQuestionCaptureFlow){camRestoreLastPhoto();camOpenDecision(uiErrorText(error));}
       else {camClosePhotoUi();setState(AppState::Error,error);}return true;
     }
@@ -215,7 +216,7 @@ static bool camPhotoHandleKey(char key, bool click, bool longPress) {
   } else {
     if (!camPhoto.confirmed) {
       // TF failure still permits a clearly labelled temporary PSRAM candidate.
-      if(!camArchiveJpeg(camPhoto.jpeg, camPhoto.size, camPhoto.imagePath, camPhoto.capturedAtEpoch) && camPhotoOnly) {
+      if(!camPhoto.imagePath.length() && !camArchiveJpeg(camPhoto.jpeg, camPhoto.size, camPhoto.imagePath, camPhoto.capturedAtEpoch) && camPhotoOnly) {
         camViewSprite.fillRect(0,204,240,36,TFT_BLACK); camViewSprite.setFont(&fonts::efontCN_12);
         camViewSprite.setTextColor(TFT_RED,TFT_BLACK); camViewSprite.setCursor(3,207);
         camViewSprite.print(uiText("保存失败，请检查TF卡后重试","Save failed; check TF and retry","Save failed; check TF and retry")); camViewSprite.pushSprite(0,0); return true;

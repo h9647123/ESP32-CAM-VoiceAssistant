@@ -1,0 +1,42 @@
+[
+  {
+    "test": "test-v047-offline",
+    "exit": 0
+  },
+  {
+    "test": "test-v0411-ui",
+    "exit": 0
+  },
+  {
+    "test": "test-v0412-storage",
+    "exit": 0
+  },
+  {
+    "test": "test-v0413-tls-retry",
+    "exit": 0
+  },
+  {
+    "test": "test-v0415-web",
+    "exit": 0
+  },
+  {
+    "test": "test-v0416-thumbs",
+    "exit": 0
+  },
+  {
+    "test": "test-v0417-render",
+    "exit": 0
+  },
+  {
+    "test": "test-stream-bottom",
+    "exit": 0
+  },
+  {
+    "test": "test-stream-reveal",
+    "exit": 0
+  },
+  {
+    "test": "test-media-index",
+    "exit": 0
+  }
+]

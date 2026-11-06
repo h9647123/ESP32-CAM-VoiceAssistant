@@ -2,7 +2,7 @@ from host_toolchain import host_compiler, arduinojson_include
 """Run the actual retry function against SDK-like stop-clears-trust semantics."""
 from pathlib import Path
 import os,subprocess,json
-root=Path(__file__).resolve().parents[1];out=root/'validation/20261031-v0413';out.mkdir(parents=True,exist_ok=True)
+root=Path(__file__).resolve().parents[1];out=Path(os.environ.get("CAM_TEST_OUTPUT", str(root/"validation/20261031-v0413")));out.mkdir(parents=True,exist_ok=True)
 source=(root/'VoiceAssistant/iat_dns_fallback.h').read_text(encoding='utf-8')
 retry='static bool iatConnectWithDnsFallback('+source.split('static bool iatConnectWithDnsFallback(',1)[1]
 prefix=r'''
@@ -54,7 +54,7 @@ int main(){
 }
 '''
 test=out/'tls-retry-test.cpp';test.write_text(prefix+retry+checks,encoding='utf-8')
-host=root/'.build-host';env=os.environ.copy()
+host=root/'.build-host';host.mkdir(exist_ok=True);env=os.environ.copy()
 for key,folder in [('TEMP','tmp'),('TMP','tmp'),('ZIG_GLOBAL_CACHE_DIR','global-cache'),('ZIG_LOCAL_CACHE_DIR','local-cache')]:(host/folder).mkdir(parents=True,exist_ok=True);env[key]=str(host/folder)
 exe=out/'tls-retry-test.exe'
 subprocess.run([*host_compiler(),'-std=c++17','-I',str(root/'tools/host-tests'),str(test),'-o',str(exe)],env=env,check=True)

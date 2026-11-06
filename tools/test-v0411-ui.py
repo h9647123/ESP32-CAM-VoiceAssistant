@@ -6,7 +6,7 @@ import os
 import subprocess
 
 root = Path(__file__).resolve().parents[1]
-out = root/'validation/20261031-v0411'
+out = Path(os.environ.get("CAM_TEST_OUTPUT", str(root/"validation/20261031-v0411")))
 out.mkdir(parents=True, exist_ok=True)
 source = (root/'VoiceAssistant/VoiceAssistant.ino').read_text(encoding='utf-8')
 fade = 'static void animatePageTransition(bool forward) {' + source.split(
@@ -46,14 +46,15 @@ int main(){
 '''
 # Execute the new camera B/C adjustment branches and the actual A edit route.
 adjust = source.split('static void changeMenuValue(int delta, bool fast) {',1)[1]
-adjust = '  if (item == MenuVideoSize) {' + adjust.split('  if (item == MenuVideoSize) {',1)[1].split(
+adjust = '  if(item==MenuSearchProvider){' + adjust.split('  if(item==MenuSearchProvider){',1)[1].split(
     '  } else if (item == MenuBrightness) {',1)[0] + '  }\n'
 route = source.split('static void handleButtonA(bool click, bool longPress, bool repeat, bool released) {',1)[1]
 route = '  if (item == MenuPhotoOnly ||' + route.split('  if (item == MenuPhotoOnly ||',1)[1].split(
     '  if (item == MenuProvider) {',1)[0]
 prefix += '''
 enum MenuItem{MenuPhotoOnly,MenuVideoSize,MenuCamera,MenuQuestionMode,MenuEnableThinking,
- MenuThinkingDisplay,MenuAsrProvider,MenuAsr,MenuSearch};
+ MenuThinkingDisplay,MenuAsrProvider,MenuAsr,MenuSearch,MenuSearchProvider};
+struct SearchConfig{uint8_t searchProvider=0;}cfg;
 static bool camPhotoOnly=false,camFullPreview=false,camVisionEnabled=false,menuEditing=false;
 static uint8_t camVideoResolution=1;
 static int cameraSaves=0,runtimeSaves=0,cancels=0;
@@ -67,11 +68,12 @@ prefix += 'static void adjust(MenuItem item,int delta){'+adjust+'}\n'
 prefix += 'static void select(MenuItem item){'+route+'}\n'
 checks = checks.replace('int main(){','''int main(){
  for(MenuItem item: {MenuPhotoOnly,MenuVideoSize,MenuCamera,MenuQuestionMode,MenuEnableThinking,
-     MenuThinkingDisplay,MenuAsrProvider,MenuAsr,MenuSearch}) {
+     MenuThinkingDisplay,MenuAsrProvider,MenuAsr,MenuSearch,MenuSearchProvider}) {
   int saved=cameraSaves+runtimeSaves;
   select(item);assert(menuEditing);assert(cameraSaves+runtimeSaves==saved);
   select(item);assert(!menuEditing);assert(cameraSaves+runtimeSaves==saved+1);
  }
+ adjust(MenuSearchProvider,-1);assert(cfg.searchProvider==2);adjust(MenuSearchProvider,1);assert(cfg.searchProvider==0);
  adjust(MenuVideoSize,-1);assert(camVideoResolution==0);
  adjust(MenuVideoSize,-1);assert(camVideoResolution==2);
  adjust(MenuVideoSize,1);assert(camVideoResolution==0);
@@ -83,9 +85,10 @@ checks = checks.replace('int main(){','''int main(){
 test = out/'menu-transition-test.cpp'
 test.write_text(prefix+fade+checks, encoding='utf-8')
 host = root/'.build-host'
+host.mkdir(exist_ok=True)
 env = os.environ.copy()
 for key, folder in [('TEMP','tmp'),('TMP','tmp'),('ZIG_GLOBAL_CACHE_DIR','global-cache'),('ZIG_LOCAL_CACHE_DIR','local-cache')]:
-    (host/folder).mkdir(parents=True,exist_ok=True); env[key] = str(host/folder)
+    (host/folder).mkdir(parents=True,exist_ok=True);env[key] = str(host/folder)
 exe = out/'menu-transition-test.exe'
 subprocess.run([*host_compiler(),'-std=c++17',str(test),'-o',str(exe)], env=env, check=True)
 subprocess.run([str(exe)],check=True)
@@ -100,7 +103,7 @@ assert 'menuReturnRoot();\n      animatePageTransition(true);' in source
 assert 'if (menuGroup == -1) {\n    animatePageTransition(true);\n    menuGroup=menuIndex;' in source
 assert 'if (menuGroup >= 0) { animatePageTransition(false); menuReturnRoot(); drawPage2(); return; }' in source
 report = dict(actual_fade_functions_host_test_passed=True,brightness_values_tested=[1,5,20,50,100],fade_total_ms=84,
-    actual_a_edit_routes_tested=9,actual_camera_bc_adjustment_branches_passed=True,
+    actual_a_edit_routes_tested=10,actual_camera_bc_adjustment_branches_passed=True,
     home_to_menu_and_root_to_submenu_share_transition=True,sleep_max_minutes=30,
     sleep_menu_serial_web_import_load_and_save_checked=True,hardware_tested=False,flashed=False)
 (out/'ui-tests.json').write_text(json.dumps(report,indent=2)+'\n',encoding='utf-8')

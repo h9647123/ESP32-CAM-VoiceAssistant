@@ -6,7 +6,7 @@
 | --- | --- |
 | VoiceAssistant.ino | 状态机、主 UI/MENU、串口/Web 配置、ASR/LLM、会话和流式文本 |
 | cam_board.h / cam_tls.h | 固定引脚覆盖、显示方向、CA bundle/时钟 |
-| buffered_mic.h / asr_capture_limits.h | 独立 I2S、完整 PCM 缓冲、录音和上传容量策略 |
+| buffered_mic.h / asr_capture_limits.h | 独立 I2S、V2 分块上传 / CUSTOM 完整 PCM 缓冲、容量策略 |
 | xfyun_iat_v2.h / iat_endpoint.h | 讯飞 V2 协议、动态修正、CUSTOM URL 校验 |
 | iat_dns_packet.h / iat_dns_fallback.h | 有界 DNS A/CNAME 解析、传输失败后备用解析、重绑 TLS 信任 |
 | cam_capture.h / cam_jpeg_stream.h | JPEG 所有权、PSRAM/TF 回退、流式 Base64 编码 |
@@ -49,3 +49,7 @@ CUSTOM DNS 重试只在系统路径传输失败后启用，对 IP、本地域名
 - tools/test-v047-offline.py、test-v0411-ui.py、test-v0412-storage.py、test-v0413-tls-retry.py：当前源码函数/头文件的主机测试。
 
 本地还有特定开发机的刷写计划、历史固件校验、凭据导入、实时设备控制与截图回归工具。它们依赖原机目录、私有回退和设备状态，未作为通用安装工具发布；其测试结论在验证摘要中区分。完整 Flash、原始日志、音视频、个人对话以及原始交接全文均不发布。
+
+## 当前新增模块
+
+cam_http_ui.h 协调 HTTP 工作任务与等待 UI；cam_stream_reveal.h 负责 UTF-8 渐进节奏；cam_strict_json.h 避免原始控制字符破坏 JSONL；cam_chat_thumbs.h 与 cam_web_research.h 分别管理图片预览和有界搜索摘要。删除/隐藏、相册预热和相机后台任务竞争的最终行为见 README 和本轮发布说明。

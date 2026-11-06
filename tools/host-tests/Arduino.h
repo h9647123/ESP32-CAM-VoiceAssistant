@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <cstring>
 #include <string>
+#include <cstdlib>
 #include <type_traits>
 using std::min;
 using std::max;
@@ -17,6 +18,7 @@ public:
  template<class T,typename std::enable_if<std::is_integral<T>::value&&!std::is_same<T,char>::value,int>::type=0>
  String(T value):std::string(std::to_string(value)){}
  using std::string::operator=;
+ bool reserve(size_t n){try{std::string::reserve(n);return true;}catch(...){return false;}}
  String& operator=(const char* s){std::string::operator=(s?s:"");return *this;}
  String substring(size_t begin,size_t end=std::string::npos)const{begin=min(begin,size());end=min(end,size());return substr(begin,end>begin?end-begin:0);}
  bool startsWith(const String& s)const{return compare(0,s.size(),s)==0;}
@@ -29,6 +31,8 @@ public:
  void trim(){auto first=find_first_not_of(" \t\r\n");if(first==npos){clear();return;}erase(0,first);erase(find_last_not_of(" \t\r\n")+1);}
  void toLowerCase(){for(char& c:*this)if(c>='A'&&c<='Z')c=char(c+32);}
  bool concat(const char* s){append(s);return true;}
+ long toInt()const{return std::strtol(c_str(),nullptr,10);}
+ bool concat(const char* s,size_t n){append(s,n);return true;}
 };
 class Print {
 public:

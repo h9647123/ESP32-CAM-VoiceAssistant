@@ -63,7 +63,15 @@ static void camPrintStatus() {
 }
 
 static void camPrintHelp() {
-  Serial.println("CAM draft2: snap [qvga|vga|uxga] | cam status | cam ask <text> | cam retry");
+  Serial.println("  cam hidden list | cam unhide <photo.jpg> | cam photo verify <photo.jpg>");
+  Serial.println("  cam help | cam debug | cam preview | cam album | cam videos | cam view export | ui screenshot");
+  Serial.println("  searchprovider tavily|deepseek|custom|status | searchmode off|on|auto|agent|status");
+  Serial.println("  customsearchurl <HTTP(S) endpoint> | searchkey deepseek|custom <key>|clear");
+  Serial.println("  searchfetch on|off (AUTO: at most 3 pages) | searchsources | webstatus");
+  Serial.println("  models (image capability labels) | modeladd <id> vision|text | modelremove <id>");
+  Serial.println("  llm reply on|off (completed visible answer on serial, default on)");
+  Serial.println("  Web camera: POST /api/cam/capture, GET /api/cam/photo (Web UI must be enabled)");
+  Serial.println("CAM v0.4.16: snap [qvga|vga|uxga] | cam status | cam ask <text> | cam retry");
   Serial.println("  cam cancel | cam new | cam mode vision|text (saved) | cam detail low|original");
   Serial.println("  cam allowmodel on|off (mark current model image support; applies only to this endpoint/model) | sd status|mount|off");
   Serial.println("  cam signals (sample PCLK/VSYNC/HREF levels for 500ms; no pin reconfiguration)");

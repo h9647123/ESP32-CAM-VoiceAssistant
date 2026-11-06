@@ -69,7 +69,7 @@ details.sec>.body{padding:0 12px 12px}
 <div class="panel" id="p-cfg">
   <details class="sec" open><summary>Wi-Fi 网络</summary><div class="body">
     <label>当前</label><div class="slot" id="wifinow">-</div>
-    <label>SSID</label><input id="w_ssid" type="text" placeholder="例如 2-2-303">
+    <label>SSID</label><input id="w_ssid" type="text" placeholder="example-network">
     <label>密码（留空则用已绑定的预设槽）</label><input id="w_pw" type="text">
     <button onclick="joinWifi()">连接</button>
     <div id="wres"></div>
@@ -111,7 +111,7 @@ details.sec>.body{padding:0 12px 12px}
       <label>Base URL</label><input id="np_url" type="text" placeholder="https://api.deepseek.com/v1">
       <label>API Key（留空表示不修改已有 key）</label><input id="np_key" type="text">
       <label>默认模型 id（可留空）</label><input id="np_model" type="text">
-      <label>默认模型是否支持识图（必选）</label><select id="np_vision"><option value="">请选择</option><option value="true">支持识图</option><option value="false">不支持，仅文本</option></select>
+      <label>默认模型是否支持识图（填写模型时必选）</label><select id="np_vision"><option value="">请选择</option><option value="true">支持识图</option><option value="false">不支持，仅文本</option></select>
       <button onclick="addProv()">保存 provider</button>
       <div id="npres"></div>
     </details>
@@ -139,7 +139,18 @@ details.sec>.body{padding:0 12px 12px}
       <button onclick="apply({language:$('s_lang').value})">应用</button></div>
   </div></details>
 
+  <details class="sec"><summary>相机拍照与预览</summary><div class="body">
+    <button onclick="captureCam()">拍照并预览</button><button onclick="previewCam()">刷新当前照片</button>
+    <p id="cam_result">不自动发送给模型，设备忙碌时请稍候。</p>
+    <img id="cam_photo" alt="当前拍摄照片" hidden style="max-width:100%;height:auto;border-radius:8px">
+  </div></details>
   <details class="sec"><summary>推理与搜索</summary><div class="body">
+    <label>摘要不足时补抓取一页（默认关闭）</label><div class="row"><select id="s_search_fetch"><option value="0">关闭</option><option value="1">开启，最多一页</option></select><button onclick="apply({search_fetch:$('s_search_fetch').value})">应用</button></div>
+    <label>搜索服务商</label><div class="row"><select id="s_search_provider"><option value="0">Tavily</option><option value="1">DeepSeek</option><option value="2">H964</option></select><button onclick="apply({search_provider:$('s_search_provider').value})">应用</button></div>
+    <label>DeepSeek 搜索 Key（留空保留）</label><div class="row"><input id="s_ds_key" type="password" autocomplete="off"><button onclick="saveSearchKey('deepseek')">保存</button></div>
+    <label>H964 搜索 URL</label><div class="row"><input id="s_cs_url" placeholder="https://asr.example.com/v1/tools/search"><button onclick="apply({custom_search_url:$('s_cs_url').value})">应用</button></div>
+    <label>H964 搜索 Key（留空保留）</label><div class="row"><input id="s_cs_key" type="password" autocomplete="off"><button onclick="saveSearchKey('custom')">保存</button></div>
+
     <label>推理模式</label>
     <div class="row"><select id="s_think"><option value="0">关闭</option><option value="1">开启</option></select>
       <button onclick="apply({thinking:$('s_think').value})">应用</button></div>
@@ -204,6 +215,9 @@ async function settings(){let t=await get('/api/settings');let o={};
  if(o.thinking!==undefined)$('s_think').value=o.thinking;
  if(o.thinking_show!==undefined)$('s_think_show').value=o.thinking_show;
  if(o.search!==undefined)$('s_search').value=o.search;
+ if(o.search_fetch!==undefined)$('s_search_fetch').value=o.search_fetch;
+ if(o.search_provider!==undefined)$('s_search_provider').value=o.search_provider;
+ if(o.custom_search_url!==undefined)$('s_cs_url').value=o.custom_search_url;
  if(o.ssid!==undefined&&o.ssid!=='(none)')$('w_ssid').placeholder=o.ssid;}
 async function saveSlot(){let t=await post('/api/slot',{slot:$('slot').value,pass:$('pass').value});
  $('pass').value='';alert(t);slots();}
@@ -213,8 +227,11 @@ async function joinWifi(){let b=$('wres');b.textContent='连接中…（可能�
  $('w_pw').value='';status();settings();}
 async function setProv(){alert(await post('/api/provider',{name:$('prov').value}));status();models();settings();}
 async function setMdl(){alert(await post('/api/model',{id:$('mdl').value}));status();models();settings();}
+function previewCam(){let image=$('cam_photo');image.hidden=false;image.src='/api/cam/photo?t='+Date.now();image.onerror=()=>{$('cam_result').textContent='照片暂不可用，请先拍照或等待设备空闲';};}
+async function captureCam(){let result=$('cam_result');result.textContent='正在拍照...';try{let r=await fetch('/api/cam/capture',{method:'POST'});result.textContent=await r.text();if(r.ok)previewCam();}catch(e){result.textContent='连接失败，请检查设备';}}
+async function saveSearchKey(kind){let input=$(kind==='deepseek'?'s_ds_key':'s_cs_key');if(!input.value)return;let data={};data[kind==='deepseek'?'deepseek_search_key':'custom_search_key']=input.value;await apply(data);input.value='';}
 async function apply(o){alert(await post('/api/settings',o));status();settings();}
-async function addProv(){let b=$('npres');if(!$('np_vision').value){b.textContent='请选择默认模型是否支持识图';return;}b.textContent='保存中…';
+async function addProv(){let b=$('npres');if($('np_model').value.trim()&&!$('np_vision').value){b.textContent='请选择默认模型是否支持识图';return;}b.textContent='保存中…';
  let t=await post('/api/provider/add',{name:$('np_name').value,url:$('np_url').value,
   key:$('np_key').value,model:$('np_model').value,vision:$('np_vision').value});
  b.textContent=t;$('np_key').value='';$('np_model').value='';

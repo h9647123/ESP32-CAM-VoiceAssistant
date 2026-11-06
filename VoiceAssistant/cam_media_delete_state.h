@@ -5,13 +5,14 @@
 // The pending target is copied, never looked up again from the current cursor.
 // Filesystem mutation belongs to the caller and requires Confirm explicitly.
 struct CamMediaDeleteState {
-  enum class Action { Waiting, Cancel, Confirm };
+  enum class Action { Waiting, Cancel, Advance, Hide, Confirm };
   bool active = false;
   bool video = false;
+  bool finalConfirm = false;
   size_t index = 0;
   char path[128] = {};
 
-  void clear() { active = false; path[0] = 0; }
+  void clear() { active = false; finalConfirm = false; path[0] = 0; }
   bool begin(bool isVideo, size_t selected, const char* target) {
     clear();
     if (!target) return false;
@@ -29,10 +30,20 @@ struct CamMediaDeleteState {
   bool matches(bool isVideo, size_t selected, const char* target) const {
     return active && video == isVideo && index == selected && target && !strcmp(path, target);
   }
-  Action action(char key, bool click, bool longPress) const {
+  Action action(char key, bool click, bool longPress) {
     if (!active) return Action::Waiting;
-    if ((key == 'A' && longPress) || (click && (key == 'B' || key == 'C'))) return Action::Cancel;
-    if (key == 'A' && click && !longPress) return Action::Confirm;
+    if(key=='A' && longPress)return Action::Cancel;
+    if(!click || longPress)return Action::Waiting;
+    if(video) { // Preserve the existing video confirmation behavior.
+      if(key=='B' || key=='C')return Action::Cancel;
+      if(key=='A')return Action::Confirm;
+    }else {
+      if(key=='C')return Action::Cancel;
+      if(!finalConfirm) {
+        if(key=='B')return Action::Hide;
+        if(key=='A'){finalConfirm=true;return Action::Advance;}
+      }else if(key=='B')return Action::Confirm;
+    }
     return Action::Waiting;
   }
 };

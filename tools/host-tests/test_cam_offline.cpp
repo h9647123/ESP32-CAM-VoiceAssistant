@@ -8,6 +8,8 @@
 #include <iostream>
 #include <fstream>
 #include "cam_queue_under_test.h"
+struct RouteConfig{String llmModelId="fixture-model";}cfg;
+static String uiText(const char* cn,const char*,const char*){return cn;}
 #include "cam_mode_routes_under_test.h"
 int main(int argc,char**argv){
  {
@@ -92,10 +94,10 @@ int main(int argc,char**argv){
   const char* p=video?"/video/V0001.avi":"/photo/P0001.jpg";
   assert(d.begin(video,2,p));assert(d.matches(video,2,p));
   assert(!d.matches(video,1,p));assert(!d.matches(!video,2,p));assert(!d.matches(video,2,"/photo/other.jpg"));
-  assert(d.action('C',true,false)==A::Cancel);assert(d.action('B',true,false)==A::Cancel);
+  assert(d.action('C',true,false)==A::Cancel);assert(d.action('B',true,false)==(video?A::Cancel:A::Hide));
   assert(d.action('A',false,true)==A::Cancel);assert(d.action('A',true,true)==A::Cancel);
   assert(d.action('A',false,false)==A::Waiting);assert(d.action('B',false,true)==A::Waiting);
-  assert(d.action('A',true,false)==A::Confirm);assert(d.active); // caller must verify SD and locked target
+  if(video)assert(d.action('A',true,false)==A::Confirm);else {assert(d.action('A',true,false)==A::Advance);assert(d.finalConfirm);assert(d.action('A',true,false)==A::Waiting);assert(d.action('B',true,false)==A::Confirm);}assert(d.active); // caller must verify SD and locked target
   d.clear();assert(!d.active);assert(d.action('A',true,false)==A::Waiting);
  }
  for(const char* p:{"/photo/../a.jpg","/photo/a/b.jpg","/photo/a\\b.jpg","/photo/a.avi","/video/a.avi","/photo/.jpg","/photo/"})assert(!d.begin(false,0,p));
@@ -119,5 +121,9 @@ int main(int argc,char**argv){
  {CamJpegSource wrong[]={{nullptr,6,"/photo/a.jpg"}};CamMultiJpegRequestStream stream(parts,wrong,1,fs);assert(stream.read()==-1);assert(stream.failed());}
  // Read failure after a valid open, as with a card/file disappearing during upload.
  {File f=fs.open("/photo/a.jpg",FILE_READ);String a="",b="";CamJpegRequestStream stream(a,b,nullptr,2000,&f);while(stream.read()>=0){}assert(stream.failed());assert(stream.available()==-1);f.close();}
- assert(fs.opens==0);std::cout<<"delete_state_and_stream_checks_passed\n";
+ {std::vector<uint8_t> jpeg(2048,42);CamJpegSource source[]={{jpeg.data(),jpeg.size(),""}};
+  auto cancel=+[](){static unsigned calls=0;return ++calls>=2;};
+  CamMultiJpegRequestStream stream(parts,source,1,fs,cancel);size_t emitted=0;while(stream.read()>=0)++emitted;
+  assert(stream.failed() && emitted==1024);}
+ assert(fs.opens==0);std::cout<<"delete_state_and_stream_checks_passed; upload cancel checked every 1024 bytes\n";
 }

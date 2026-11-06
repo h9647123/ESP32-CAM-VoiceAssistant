@@ -7,7 +7,9 @@
 #include <freertos/semphr.h>
 
 // One producer owns I2S and PCM until completion. No UI, sockets or logging on
-// this task. The consumer may read the immutable recording only after wait().
+// this task. Consumers may read only the published [0,samples.load(acquire))
+// prefix while active, or the whole recording after wait(). Published samples
+// are never modified, so networking cannot interrupt I2S capture.
 class BufferedMic {
  public:
   struct Stats {
@@ -67,6 +69,7 @@ class BufferedMic {
     pending_=false;return true;
   }
   void cancel() { cancel_=true; wait(500); }
+  void release() {if(!active() && wait(0)){free(data);data=nullptr;capacity=0;}}
   bool good() const {
     return !active() && stats.samples && !stats.i2sOverflow && !stats.bufferOverflow && !stats.readErrors;
   }

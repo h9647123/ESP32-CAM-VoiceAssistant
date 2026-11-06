@@ -93,8 +93,8 @@ struct CamJpegSource {
 // Only one file and one 768-byte base64 source buffer are active at a time.
 class CamMultiJpegRequestStream : public Stream {
  public:
-  CamMultiJpegRequestStream(const String* parts,const CamJpegSource* sources,size_t count,fs::FS& filesystem)
-      : parts_(parts),sources_(sources),count_(count),filesystem_(filesystem) {
+  CamMultiJpegRequestStream(const String* parts,const CamJpegSource* sources,size_t count,fs::FS& filesystem,bool (*cancelled)()=nullptr)
+      : parts_(parts),sources_(sources),count_(count),filesystem_(filesystem),cancelled_(cancelled) {
     if(!parts || !sources || !count || count>6) {failed_=true;return;}
     for(size_t i=0;i<=count;++i)total_+=parts[i].length();
     for(size_t i=0;i<count;++i) {
@@ -123,6 +123,7 @@ class CamMultiJpegRequestStream : public Stream {
  private:
   int next() {
     if(failed_)return -1;
+    if(cancelled_ && (emitted_%1024==0) && cancelled_()){failed_=true;return -1;}
     while(index_<count_) {
       if(!active_) {
         const auto& source=sources_[index_];
@@ -144,6 +145,7 @@ class CamMultiJpegRequestStream : public Stream {
   const CamJpegSource* sources_;
   const size_t count_;
   fs::FS& filesystem_;
+  bool (*cancelled_)()=nullptr;
   String empty_;
   File file_;
   CamJpegRequestStream* active_=nullptr;

@@ -33,6 +33,7 @@ struct CamPhoto {
 };
 
 static CamPhoto camPhoto;
+static bool camValidationMode=false; // Reversible RAM-only API regression; never saved.
 static constexpr uint8_t CAM_QUESTION_PHOTO_LIMIT=3;
 static constexpr size_t CAM_QUESTION_PHOTO_RAM_LIMIT=2U*1024U*1024U;
 static CamPhoto camEarlierPhotos[CAM_QUESTION_PHOTO_LIMIT-1];
@@ -45,6 +46,13 @@ static uint32_t camPhotoGeneration = 0;
 static bool camQuestionRequiresPhoto = false;
 static bool camCameraReady = false;
 static bool camSdReady = false;
+static uint32_t camMediaRevision=1,camPhotoIndexRevision=1,camVideoIndexRevision=1;
+static void camMediaChanged(const String& path) {
+  ++camMediaRevision;
+  if(path.startsWith("/photo/"))camPhotoIndexRevision=camMediaRevision;
+  else camVideoIndexRevision=camMediaRevision;
+}
+static void camMediaMountChanged(){++camMediaRevision;camPhotoIndexRevision=camVideoIndexRevision=camMediaRevision;}
 static uint64_t camSdTotalBytes = 0;
 static uint64_t camSdUsedBytes = 0;
 static uint32_t camSdUsageCheckedAt = 0;
@@ -148,7 +156,7 @@ static void camPrintMemory(const char* tag) {
 static bool camMountSd() {
   if (camSdReady) return true;
   SD_MMC.end();
-  camPhotoSequenceReady = false;
+  camPhotoSequenceReady = false;camMediaMountChanged();
   // CLK=46 has a hardware pulldown. Initialize only after the ROM boot phase.
   Serial.printf("[CAM-SD] mount 1-bit CLK=%d CMD=%d D0=%d frequency_khz=%u format_on_failure=0\n",
       CAM_SD_CLK, CAM_SD_CMD, CAM_SD_D0, unsigned(SDMMC_FREQ_DEFAULT));
@@ -169,33 +177,62 @@ static bool camMountSd() {
 }
 
 static void camSdFailed() {
-  camSdReady = false;
+  camSdReady = false;camMediaMountChanged();
   // The caller closes its File before invalidating the mount.
   SD_MMC.end();
   Serial.println("[CAM-SD] I/O failed; use 'sd mount' after reinserting the card");
 }
 
-static String camNextPhotoPath(int64_t capturedAt) {
-  if (!camPhotoSequenceReady) {
-    File directory = SD_MMC.open("/photo");
-    for (File f = directory.openNextFile(); f; f = directory.openNextFile()) {
-      if (!f.isDirectory()) {
-        const auto key = camParsePhotoKey(f.name());
-        if (key.order > camPhotoSequence) camPhotoSequence = key.order;
-      }
-      f.close();
-    }
-    directory.close();
-    camPhotoSequenceReady = true;
+static CamPhotoKey camReadMediaKey(const String& path,int64_t legacyTime=0) {
+  CamPhotoKey key=camParsePhotoKey(path.c_str(),legacyTime);
+  if(!key.order && path.indexOf("/video/V")>=0) {
+    String old=path.substring(path.lastIndexOf('/')+1);old.setCharAt(0,'P');
+    old=old.substring(0,old.lastIndexOf('.'))+".jpg";key=camParsePhotoKey(old.c_str(),legacyTime);
   }
-  if (!camBootTag) camBootTag = esp_random() | 1U;
-  char name[64];
-  do {
-    snprintf(name, sizeof(name), "/photo/P%016llx_T%010llu.jpg",
-        (unsigned long long)++camPhotoSequence,
-        (unsigned long long)(camValidPhotoTime(capturedAt) ? capturedAt : 0));
-  } while (SD_MMC.exists(name) || SD_MMC.exists(String(name) + ".tmp"));
-  return String(name);
+  File meta=SD_MMC.open(path+".meta",FILE_READ);char magic[4];uint64_t order=0;int64_t epoch=0;
+  if(meta && meta.read((uint8_t*)magic,4)==4 && !memcmp(magic,"CAM1",4) &&
+      meta.read((uint8_t*)&order,8)==8 && meta.read((uint8_t*)&epoch,8)==8 && order)
+    {key.order=order;key.epoch=camValidPhotoTime(epoch)?epoch:0;}
+  meta.close();return key;
+}
+static void camWriteMediaKey(const String& path,int64_t epoch) {
+  camMediaChanged(path);
+  File meta=SD_MMC.open(path+".meta",FILE_WRITE);
+  const bool ok=meta && meta.write((const uint8_t*)"CAM1",4)==4 &&
+    meta.write((const uint8_t*)&camPhotoSequence,8)==8 && meta.write((const uint8_t*)&epoch,8)==8;
+  if(meta){meta.flush();meta.close();}if(!ok)Serial.println("[CAM-MEDIA] metadata write failed; filename time fallback");
+}
+static void camPrepareMediaSequence() {
+  if(!camPhotoSequenceReady) {
+    Preferences p;if(p.begin("cam_media",true)){camPhotoSequence=p.getULong64("seq",0);p.end();}
+    for(const char* directory:{"/photo","/video"}) {
+      File dir=SD_MMC.open(directory);
+      for(File f=dir.openNextFile();f;f=dir.openNextFile()){
+        if(!f.isDirectory() && (String(f.name()).endsWith(".jpg") || String(f.name()).endsWith(".avi")))
+          camPhotoSequence=max(camPhotoSequence,camReadMediaKey(f.path(),f.getLastWrite()).order);
+        f.close();yield();
+      }dir.close();
+    }
+    camPhotoSequenceReady=true;
+  }
+}
+static String camNextMediaPath(const char* folder,const char* prefix,const char* extension,int64_t capturedAt) {
+  camPrepareMediaSequence();
+  ++camPhotoSequence;Preferences p;
+  if(p.begin("cam_media",false)){p.putULong64("seq",camPhotoSequence);p.end();}
+  // Offline labels use 2000-01-01 plus a persistent sequence. Metadata marks
+  // their wall time unknown, while the sequence preserves the true timeline.
+  time_t label=camValidPhotoTime(capturedAt)?capturedAt:946684800LL+camPhotoSequence;
+  String path;
+  do {struct tm value;localtime_r(&label,&value);char stamp[20];strftime(stamp,sizeof(stamp),"%Y%m%d%H%M%S",&value);
+    path=String(folder)+"/"+prefix+stamp+extension;++label;
+  } while(SD_MMC.exists(path) || SD_MMC.exists(path+".tmp") ||
+      SD_MMC.exists(path.substring(0,path.lastIndexOf('.'))+".avi") ||
+      SD_MMC.exists(path.substring(0,path.lastIndexOf('.'))+".part"));
+  return path;
+}
+static String camNextPhotoPath(int64_t capturedAt) {
+  return camNextMediaPath("/photo","P-",".jpg",capturedAt);
 }
 
 static bool camArchiveJpeg(const uint8_t* bytes, size_t size, String& path, int64_t capturedAt = 0) {
@@ -223,6 +260,7 @@ static bool camArchiveJpeg(const uint8_t* bytes, size_t size, String& path, int6
     return false;
   }
   path = finalPath;
+  camWriteMediaKey(finalPath,capturedAt);
   // Archive limits bound the browser list only; saved photos need explicit deletion.
   Serial.printf("[CAM-SD] JPEG archived bytes=%u path=%s\n", unsigned(size), path.c_str());
   return true;
@@ -376,7 +414,7 @@ static bool camCapture(String& error, bool archive = true) {
   // resolution-comparison diagnostics can use the existing cam warmup command.
   // VGA preview -> UXGA shutter needs several fresh exposure frames. The full
   // preview mode only discards the one queued frame and never changes readout.
-  for (int i = 0; i < (changed ? 4 : 1); ++i) {
+  for (int i = 0; i < (changed ? 2 : 1); ++i) {
     camera_fb_t* stale = esp_camera_fb_get();
     if (stale) esp_camera_fb_return(stale);
   }
@@ -422,6 +460,7 @@ static bool camCapture(String& error, bool archive = true) {
 
 static bool camAppendHistory(uint8_t session, const String& role, const String& content,
     const String& provider, const String& model, const char* status, const String& imagePath) {
+  if(camValidationMode)return true;
   if (!camSdReady) return false;
   const String path = "/history/session" + String(session) + ".jsonl";
   File probe = SD_MMC.open(path, FILE_READ);
@@ -458,13 +497,13 @@ static bool camAppendHistory(uint8_t session, const String& role, const String& 
   record["provider"] = provider;
   record["model"] = model;
   record["status"] = status;
-  String line;
-  serializeJson(record, line);
-  if (record.overflowed() || line.length() > 65536) return false;
+  const size_t bytes=measureJson(record);
+  if (record.overflowed() || bytes > 65536) return false;
   File out = SD_MMC.open(path, FILE_APPEND);
   bool ok = bool(out);
   if (ok && brokenTail) ok = out.write('\n') == 1; // isolate any power-loss fragment
-  if (ok) ok = out.write(reinterpret_cast<const uint8_t*>(line.c_str()), line.length()) == line.length();
+  CamStrictJsonWriter<File> writer(out);
+  if (ok) ok = serializeJson(record,writer)==bytes && writer.finish();
   if (ok) ok = out.write('\n') == 1;
   if (out) { out.flush(); out.close(); }
   if (!ok) camSdFailed();

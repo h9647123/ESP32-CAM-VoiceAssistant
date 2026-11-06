@@ -2661,5 +2661,11 @@ template<class Glyph, size_t N> static const Glyph* scienceGlyphLookup(const Gly
   while(low<high){size_t mid=low+(high-low)/2;if(table[mid].cp<cp)low=mid+1;else high=mid;}
   return low<N && table[low].cp==cp ? &table[low] : nullptr;
 }
-static const ScienceGlyph* scienceGlyph(uint32_t cp) { return scienceGlyphLookup(kScienceGlyphs,cp); }
+#include "traditional_glyphs.h"
+#include "common_science_glyphs.h"
+static const ScienceGlyph* scienceGlyph(uint32_t cp) {
+  const auto* glyph=scienceGlyphLookup(kScienceGlyphs,cp);
+  if(!glyph)glyph=scienceGlyphLookup(kCommonScienceGlyphs,cp);
+  return glyph?glyph:scienceGlyphLookup(kTraditionalGlyphs,cp);
+}
 static const ScienceSmallGlyph* scienceSmallGlyph(uint32_t cp) { return scienceGlyphLookup(kScienceSmallGlyphs,cp); }

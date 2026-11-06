@@ -1,0 +1,32 @@
+{
+  "version": "v0.4.26-cam",
+  "application_sha256": "c15f91ec6d5270f9aa745729f4bb314711f5d6104f5ef4765d25bcd94ee9221f",
+  "application_bytes": 2816960,
+  "board": "ESP32-S3 N16R8 custom CAM",
+  "fqbn": "esp32:esp32:esp32s3:PartitionScheme=huge_app,PSRAM=opi,FlashSize=16M,USBMode=hwcdc,CDCOnBoot=default",
+  "core": "3.3.8",
+  "arduinojson": "7.4.3",
+  "lovyangfx": "1.2.21",
+  "websockets": "2.7.2",
+  "zlib_turbo": "1.0.0",
+  "config": "config.h.example, credential defaults empty",
+  "production_source_changes_for_publication": [
+    "debug_page.h: replace personal SSID placeholder with example-network"
+  ],
+  "public_binary_flashed": false,
+  "local_hardware_tested_binary_sha256": "b2c4cda7e18ce3504aeeee0c0bd1c10a7862f624404634bccb341eced51dcbaa",
+  "config_definition_names_differing_from_local": [
+    "CUSTOM_IAT_MAX_RECORD_SECONDS",
+    "DHT11_PIN",
+    "DHT_PIN",
+    "MIC_SAMPLE_SHIFT",
+    "SENSOR_I2C_AHT20_BMP280",
+    "XFYUN_ASR_API_SECRET",
+    "XFYUN_ASR_HOST",
+    "XFYUN_ASR_LANGUAGE",
+    "XFYUN_ASR_PATH",
+    "XFYUN_IAT_HOST",
+    "XFYUN_IAT_PATH"
+  ],
+  "effective_microphone_shift": 16
+}

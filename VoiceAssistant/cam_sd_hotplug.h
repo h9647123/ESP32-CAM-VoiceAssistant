@@ -24,7 +24,7 @@ static void camSdHotplugTick() {
     alignas(4) uint8_t sector[512];
     if(!SD_MMC.readRAW(sector,0)) {
       camVideoLeave();camAlbumClickPending=false;
-      camSdFailed();camSdCheckedMount=camSdSelfTestOk=false;++camSdRemovals;
+      camChatThumbInvalidate();camSdFailed();camSdCheckedMount=camSdSelfTestOk=false;++camSdRemovals;
       camRefreshSdUsage(true);Serial.println("[SD-HOTPLUG] removed or I/O failure; automatic remount pending");
       if(camPhotoStage==CamPhotoStage::Album)camOpenAlbum();
       else if(camPhotoStage==CamPhotoStage::VideoAlbum)camOpenVideos();
@@ -35,7 +35,7 @@ static void camSdHotplugTick() {
     camSdCheckedMount=false;
     if(camMountSd()) {
       ++camSdMounts;camSdCheckedMount=true;camSdSelfTest();
-      Serial.println("[SD-HOTPLUG] inserted; mounted; self-test complete");
+      camChatThumbInvalidate();Serial.println("[SD-HOTPLUG] inserted; mounted; self-test complete");
       if(camPhotoStage==CamPhotoStage::Album)camOpenAlbum();
       else if(camPhotoStage==CamPhotoStage::VideoAlbum)camOpenVideos();
       else if(uiPage==UiPage::Page1 && !cfg.clockMode)drawPage1InfoLine();
