@@ -56,7 +56,39 @@ Fe^{3+}、SO_4^{2-}
 =1-x_1-x_2
 ```
 2OH^-、SO_4^{2-}
-下行中文保持完整)"
+下行中文保持完整)",
+    R"(比较分式与无括号参数
+由0<c<a<b，比较
+\frac ab < \frac{a+c}{b+c}
+\frac12 + \frac{x+1}2
+\frac\alpha\beta，\dfrac a{b+c}
+中文上下行保持完整)",
+    R"(# 一级标题
+## 二级标题
+*斜体 italic* 与 **粗体**
+~~删除线 strike~~
+> 引用文字保持完整
+> > 嵌套引用与换行
+正文恢复正常。)",
+    R"(化学方程与条件
+\ce{2H2 + O2 -> 2H2O}
+\ce{CaCO3}\xrightarrow{加热}\ce{CaO + CO2}\uparrow
+\ce{Fe^{3+} + 3OH^- -> Fe(OH)3}\downarrow
+\ce{SO4^{2-} + Ba^{2+} -> BaSO4}
+\ce{N2 + 3H2 <=> 2NH3})",
+    R"(分数方程与度数
+\frac{x+1}{x-1}=\frac32
+\frac{\sqrt3}{2}=\frac{1}{\sqrt{3}}
+\frac{\frac12}{x+1}=\frac1{2x+2}
+\left(x+1\right)^2=4
+\theta=30^\circ，60^{\circ}
+X\cdot Y≈“正确”)"
+    ,R"(示 氧 氯：笔画完整
+“双引号”‘单引号’ ≈≃≅
+X·Y，X\cdot Y，√3
+繁體：體學數電溫氣態
+離子、濃度、鹽酸、氫氧化鈉
+上下一行中文应完整)"
   };
   return page>=1 && page<=sizeof(samples)/sizeof(samples[0])?samples[page-1]:nullptr;
 }

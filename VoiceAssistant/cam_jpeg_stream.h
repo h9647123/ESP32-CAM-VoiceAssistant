@@ -107,6 +107,7 @@ class CamMultiJpegRequestStream : public Stream {
   CamMultiJpegRequestStream(const CamMultiJpegRequestStream&)=delete;
   CamMultiJpegRequestStream& operator=(const CamMultiJpegRequestStream&)=delete;
   size_t size()const{return total_;}
+  size_t emitted()const{return emitted_;}
   bool failed()const{return failed_;}
   int available()override{return failed_?-1:int(total_-emitted_);}
   int peek()override{if(peeked_<0)peeked_=next();return peeked_;}

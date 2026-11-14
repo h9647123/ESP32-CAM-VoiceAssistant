@@ -69,7 +69,7 @@ details.sec>.body{padding:0 12px 12px}
 <div class="panel" id="p-cfg">
   <details class="sec" open><summary>Wi-Fi 网络</summary><div class="body">
     <label>当前</label><div class="slot" id="wifinow">-</div>
-    <label>SSID</label><input id="w_ssid" type="text" placeholder="example-network">
+    <label>SSID</label><input id="w_ssid" type="text" placeholder="例如 2-2-303">
     <label>密码（留空则用已绑定的预设槽）</label><input id="w_pw" type="text">
     <button onclick="joinWifi()">连接</button>
     <div id="wres"></div>
@@ -159,8 +159,8 @@ details.sec>.body{padding:0 12px 12px}
       <button onclick="apply({thinking_show:$('s_think_show').value})">应用</button></div>
     <label>联网搜索模式</label>
     <div class="row"><select id="s_search">
-      <option value="0">关闭</option><option value="1">开启</option>
-      <option value="2">自动</option><option value="3">Agent</option></select>
+      <option value="0">OFF · 关闭</option>
+      <option value="2">AUTO · 自动检索与研究</option></select>
       <button onclick="apply({search:$('s_search').value})">应用</button></div>
   </div></details>
 </div>

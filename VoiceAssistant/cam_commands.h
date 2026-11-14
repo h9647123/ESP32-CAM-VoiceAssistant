@@ -65,7 +65,7 @@ static void camPrintStatus() {
 static void camPrintHelp() {
   Serial.println("  cam hidden list | cam unhide <photo.jpg> | cam photo verify <photo.jpg>");
   Serial.println("  cam help | cam debug | cam preview | cam album | cam videos | cam view export | ui screenshot");
-  Serial.println("  searchprovider tavily|deepseek|custom|status | searchmode off|on|auto|agent|status");
+  Serial.println("  searchprovider tavily|deepseek|custom|status | searchmode off|auto|status");
   Serial.println("  customsearchurl <HTTP(S) endpoint> | searchkey deepseek|custom <key>|clear");
   Serial.println("  searchfetch on|off (AUTO: at most 3 pages) | searchsources | webstatus");
   Serial.println("  models (image capability labels) | modeladd <id> vision|text | modelremove <id>");

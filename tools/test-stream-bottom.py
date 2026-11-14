@@ -11,6 +11,10 @@ code=r"""
 #include <cstdint>
 #include <vector>
 #include <cstdio>
+#include <string>
+static struct {int uiLanguage=0;}cfg;
+static std::string footerFrameKey,footerStatusDetail;
+static void markChatLinesDirty(){}
 static int PAGE1_HEADER_BOTTOM=40,CHAT_AREA_TOP=42,CHAT_VISIBLE_LINES=7,CHAT_LINE_HEIGHT=22;
 static int TFT_BLACK=0,camCandidateGeneration=0;
 static int32_t chatScrollPixels=0,chatScrollTargetPixels=0,drawn=0;

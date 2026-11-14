@@ -2,15 +2,17 @@
 #include "cam_math_samples.h"
 static bool camChatScreenshotReady();
 static void camExportChatScreen();
-static void camMathScreenshot(unsigned page,unsigned row=0) {
+static void camMathScreenshot(unsigned page,unsigned row=0,int language=-1) {
   if(!camChatScreenshotReady() || camPhoto.ready()){Serial.println("[MATH-TEST] idle home without draft photos required");return;}
-  const char* sample=camMathSample(page);if(!sample){Serial.println("[MATH-TEST] pages: 1-9; optional scroll row");return;}
+  const char* sample=camMathSample(page);if(!sample){Serial.println("[MATH-TEST] pages: 1-14; optional scroll row and cn/en");return;}
+  const auto savedLanguage=cfg.uiLanguage;if(language>=0)cfg.uiLanguage=language?UiLanguage::English:UiLanguage::Chinese;
   auto saved=std::move(chatHistory);const size_t bytes=chatHistoryBytes;
   const auto pixels=chatScrollPixels,target=chatScrollTargetPixels;const auto scroll=chatScroll;const bool autoScroll=chatAutoScrollBottom;
   chatHistory.clear();ChatMsg message;message.role="assistant";message.content=sample;if(page==8){message.thinkingTimed=message.thinkingComplete=true;message.thinkingMs=12000;}chatHistory.push_back(std::move(message));
   markChatLinesDirty();chatAutoScrollBottom=false;setChatScrollRow(row);
   Serial.printf("[MATH-TEST] page=%u row=%u source=render_buffers no_network=1 no_history_write=1\n",page,row);
   camExportChatScreen();
+  cfg.uiLanguage=savedLanguage;
   chatHistory=std::move(saved);chatHistoryBytes=bytes;chatScroll=scroll;chatScrollPixels=pixels;chatScrollTargetPixels=target;chatAutoScrollBottom=autoScroll;
   markChatLinesDirty();drawPage1();
 }

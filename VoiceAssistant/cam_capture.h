@@ -458,7 +458,7 @@ static bool camCapture(String& error, bool archive = true) {
   return true;
 }
 
-static bool camAppendHistory(uint8_t session, const String& role, const String& content,
+template<class Text> static bool camAppendHistory(uint8_t session, const String& role, const Text& content,
     const String& provider, const String& model, const char* status, const String& imagePath) {
   if(camValidationMode)return true;
   if (!camSdReady) return false;
@@ -482,12 +482,12 @@ static bool camAppendHistory(uint8_t session, const String& role, const String& 
     if (!SD_MMC.rename(path, path + ".1")) { camSdFailed(); return false; }
     brokenTail = false;
   }
-  JsonDocument record;
+  JsonDocument record(&camJsonAllocator);
   record["timestamp"] = int64_t(time(nullptr));
   record["boot_id"] = camBootTag;
   record["millis"] = millis();
   record["role"] = role;
-  record["content"] = content;
+  record["content"] = content.c_str();
   record["image_path"] = imagePath;
   if(camQuestionPhotoCount()) {
     JsonArray paths=record["image_paths"].to<JsonArray>();
@@ -498,7 +498,7 @@ static bool camAppendHistory(uint8_t session, const String& role, const String& 
   record["model"] = model;
   record["status"] = status;
   const size_t bytes=measureJson(record);
-  if (record.overflowed() || bytes > 65536) return false;
+  if (record.overflowed() || bytes > CAM_HISTORY_FILE_LIMIT) return false;
   File out = SD_MMC.open(path, FILE_APPEND);
   bool ok = bool(out);
   if (ok && brokenTail) ok = out.write('\n') == 1; // isolate any power-loss fragment

@@ -124,8 +124,8 @@ static bool camVisionOnce(size_t assistantIndex, bool stream, bool& retryable) {
   if (!camConfigureTls(client)) {
     lastError = "NTP required for verified TLS"; return false;
   }
-  client.setTimeout(8);
-  client.setHandshakeTimeout(8);
+  client.setTimeout(15000); // Stream timeout uses milliseconds, handshake uses seconds.
+  client.setHandshakeTimeout(12);
   HTTPClient http;
   http.setTimeout(min<uint32_t>(60000,LLM_STREAM_IDLE_TIMEOUT_MS));
   http.setConnectTimeout(ASR_CONNECT_TIMEOUT_MS);
@@ -151,7 +151,8 @@ static bool camVisionOnce(size_t assistantIndex, bool stream, bool& retryable) {
   if (code < 200 || code >= 300) {
     // Do not capture arbitrary response bodies; error pages can be very large.
     char tlsError[128]={};const int tlsCode=client.lastError(tlsError,sizeof(tlsError));
-    Serial.printf("[CAM-VISION-TRANSPORT] http=%d tls=%d elapsed_ms=%lu internal=%u largest=%u\n",code,tlsCode,(unsigned long)(millis()-started),unsigned(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)),unsigned(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL)));
+    Serial.printf("[CAM-VISION-TRANSPORT] http=%d tls=%d elapsed_ms=%lu internal=%u largest=%u sent=%u/%u wifi=%d connected=%d\n",code,tlsCode,(unsigned long)(millis()-started),unsigned(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)),unsigned(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL)),unsigned(upload.emitted()),unsigned(upload.size()),int(WiFi.status()),client.connected());
+    if(tlsCode)Serial.printf("[CAM-VISION-TLS] %s\n",tlsError);
     http.end();
     lastError = "Vision HTTP " + String(code);
     retryable = code < 0 || code == 429 || code >= 500;
@@ -175,7 +176,7 @@ static bool camVisionOnce(size_t assistantIndex, bool stream, bool& retryable) {
     retryable = camVisionMayRetryResponse(sink.sawSse(),result,sink.outputLimited(),camVisionCancelRequested);
     return false;
   }
-  String answer;
+  PsramString answer;
   if (sink.sawSse()) answer = sink.answer();
   else {
     JsonDocument metadata;
@@ -188,12 +189,12 @@ static bool camVisionOnce(size_t assistantIndex, bool stream, bool& retryable) {
     if (finish.length() && finish != "stop") {
       lastError = "Vision response incomplete: " + finish; return false;
     }
-    if (!parseLlmFullJson(sink.fallback(), answer)) return false;
+    String parsed;if(!parseLlmFullJson(sink.fallback(),parsed))return false;answer=parsed;
   }
-  answer = sanitizeUtf8(answer);
+  if(!camHistoryUtf8Valid(answer.c_str(),answer.length())){lastError="Vision response UTF-8 invalid";return false;}
   answer.trim();
   if (!answer.length()) { lastError = "Vision response has no text"; return false; }
-  updateChatMessageContent(assistantIndex, answer);
+  if(!camStorePsramMessage(assistantIndex,answer))return false;
   lastLlmResponseWasSse = sink.sawSse();
   Serial.printf("[CAM-VISION] complete SSE=%d answer=%u total_ms=%lu\n",
       sink.sawSse(), unsigned(answer.length()), (unsigned long)(millis() - started));
@@ -277,7 +278,7 @@ static bool camAskAndStoreVision(String question) {
   camAppendHistory(cfg.currentSession, "user", question, cfg.llmProviderName,
       cfg.llmModelId, ok ? "complete" : "pending", imagePath);
   if (!ok) {
-    const String partial = String(chatHistory[assistantIndex].content);
+    const PsramString& partial = chatHistory[assistantIndex].content;
     if (partial.length()) {
       camAppendHistory(cfg.currentSession, "assistant", partial, cfg.llmProviderName,
           cfg.llmModelId, "incomplete", imagePath);
@@ -291,7 +292,7 @@ static bool camAskAndStoreVision(String question) {
     setState(AppState::Error, lastError);
     return false; // Keep PSRAM JPEG + question for A/cam retry.
   }
-  const String answer = String(chatHistory[assistantIndex].content);
+  const PsramString& answer = chatHistory[assistantIndex].content;
   camAppendHistory(cfg.currentSession, "assistant", answer, cfg.llmProviderName,
       cfg.llmModelId, "complete", imagePath);
   camReleasePhoto();
@@ -302,7 +303,7 @@ static bool camAskAndStoreVision(String question) {
   lastFailedUseSearch = false;
   saveChatHistory();
   camPrintAssistantReply(answer);
-  paginate(answer);
+  // Layout is rendered from history; do not duplicate the full reasoning into legacy pages.
   chatScroll = SIZE_MAX;
   showPage();
   camPrintMemory("vision complete / JPEG released");

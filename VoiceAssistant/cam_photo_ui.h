@@ -87,7 +87,9 @@ static void camClosePhotoUi(bool toMenu) {
 }
 
 static void camOpenPreview() {
-  if(!camAcquireModelTransport())return;
+  // Local camera work owns no network socket. Do not wait for a background
+  // TLS health probe to time out before presenting the preview.
+  cancelServiceProbe();
   camVideoNotice="";
   if (!buttonEvents) { setState(AppState::Error, "Button sampler unavailable"); return; }
   if (recording || stoppingRecording || asrSessionActive || asrConnected || composingQuestion) return;

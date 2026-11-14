@@ -1,6 +1,7 @@
 #pragma once
 #include <string>
 #include <cstring>
+#include <cstdint>
 
 static bool latexGroup(const char* text,size_t length,size_t& at,std::string& group) {
   while(at<length && text[at]==' ')++at;
@@ -15,6 +16,24 @@ static bool latexGroup(const char* text,size_t length,size_t& at,std::string& gr
 }
 
 static bool latexDisplayToken(const char*,size_t,size_t&,std::string&,unsigned);
+// TeX arguments may be a group or one token: \frac ab, \frac12,
+// \frac{x+1}2 and \frac\alpha\beta are all valid input.
+static bool latexArgument(const char* text,size_t length,size_t& at,std::string& value,unsigned depth) {
+  size_t next=at;while(next<length && (text[next]==' ' || text[next]=='\t' || text[next]=='\r' || text[next]=='\n'))++next;
+  if(next>=length || text[next]=='}')return false;
+  if(text[next]=='{') {if(!latexGroup(text,length,next,value))return false;at=next;return true;}
+  const size_t start=next;
+  if(text[next]=='\\') {
+    std::string decoded;if(!latexDisplayToken(text,length,next,decoded,depth+1))return false;
+  } else {
+    const unsigned char ch=text[next];const size_t bytes=ch<0x80?1:ch<0xe0?2:ch<0xf0?3:4;
+    if(next+bytes>length)return false;
+    for(size_t i=1;i<bytes;++i)if((uint8_t(text[next+i])&0xc0)!=0x80)return false;
+    next+=bytes;
+  }
+  value.assign(text+start,next-start);at=next;return true;
+}
+
 // Strip balanced grouping, retaining explicit literal braces and script groups.
 // Incomplete groups remain visible until a later streaming fragment closes them.
 static std::string latexDisplayContent(const std::string& text,unsigned depth) {
@@ -114,7 +133,7 @@ static bool latexDisplayToken(const char* text, size_t length, size_t& at,
   }
   if(command=="frac" || command=="dfrac" || command=="tfrac") {
     size_t next=end;std::string a,b;
-    if(!latexGroup(text,length,next,a) || !latexGroup(text,length,next,b))return false;
+    if(!latexArgument(text,length,next,a,depth) || !latexArgument(text,length,next,b,depth))return false;
     auto normalize=[&](const std::string& input){return latexDisplayContent(input,depth+1);};
     a=normalize(a);b=normalize(b);
     // Compact fractions use one row; script-bearing fractions expand into full
@@ -125,11 +144,26 @@ static bool latexDisplayToken(const char* text, size_t length, size_t& at,
     else out+="("+a+")/("+b+")";
     at=next;return true;
   }
+  if(command=="xrightarrow" || command=="xleftarrow" || command=="xrightleftharpoons") {
+    size_t next=end;std::string below,above;
+    while(next<length && text[next]==' ')++next;
+    if(next<length && text[next]=='['){const size_t start=++next;while(next<length && text[next]!=']')++next;if(next>=length)return false;below.assign(text+start,next-start);++next;}
+    if(!latexGroup(text,length,next,above))return false;
+    out+=command=="xleftarrow"?"←":command=="xrightleftharpoons"?"⇌":"→";
+    if(!above.empty())out+="["+latexDisplayContent(above,depth+1)+"]";
+    if(!below.empty())out+="["+latexDisplayContent(below,depth+1)+"]";
+    at=next;return true;
+  }
+  if(command=="overset" || command=="underset" || command=="stackrel") {
+    size_t next=end;std::string note,base;
+    if(!latexArgument(text,length,next,note,depth) || !latexArgument(text,length,next,base,depth))return false;
+    out+=latexDisplayContent(base,depth+1)+"["+latexDisplayContent(note,depth+1)+"]";at=next;return true;
+  }
   const bool wrapper = command=="boxed" || command=="fbox" || command=="mathrm" ||
       command=="mathbf" || command=="mathit" || command=="text" || command=="ce" || command=="pu" ||
       command=="operatorname" || command=="vec" || command=="bar" || command=="overline" || command=="hat" ||
       command=="mathbb" || command=="mathcal" || command=="mathsf" || command=="mathtt" || command=="boldsymbol" ||
-      command=="textrm" || command=="textnormal" || command=="textbf" || command=="textit";
+      command=="textrm" || command=="textnormal" || command=="textbf" || command=="textit" || command=="url";
   const bool root = command=="sqrt";
   if (!wrapper && !root) return false;
   size_t open = end;
@@ -139,6 +173,11 @@ static bool latexDisplayToken(const char* text, size_t length, size_t& at,
     const size_t start=++open;while(open<length && text[open]!=']')++open;
     if(open>=length || open-start>3)return false;
     rootIndex.assign(text+start,open-start);++open;
+  }
+  if(root && open<length && text[open]!='{') {
+    std::string value;size_t next=open;
+    if(!latexArgument(text,length,next,value,depth))return false;
+    out+=(rootIndex=="3"?"³":rootIndex=="4"?"⁴":"");out+="√("+latexDisplayContent(value,depth+1)+")";at=next;return true;
   }
   if (open >= length || text[open]!='{') return false;
   unsigned nesting = 1;
@@ -194,6 +233,12 @@ static bool camFractionHasScripts(const std::string& text) {
   for(const auto* script:scripts)if(text.find(script)!=std::string::npos)return true;
   return false;
 }
+static bool camFractionNeedsFullSize(const std::string& text) {
+  if(camFractionHasScripts(text))return true;
+  unsigned characters=0;
+  for(unsigned char c:text)if((c&0xc0)!=0x80 && ++characters>2)return true;
+  return false;
+}
 // Convert only explicit, balanced (numerator)/(denominator) in fenced math.
 // Never guess the precedence of an ungrouped a+b/c or touch program code.
 static std::string camDisplayPlainFraction(const std::string& line) {
@@ -216,8 +261,8 @@ static std::string camDisplayPlainFraction(const std::string& line) {
   if(suffix!=std::string::npos && line[suffix]!='=')return line;
   return "\\frac{"+line.substr(start+1,topEnd-start-1)+"}{"+line.substr(bottom+1,bottomEnd-bottom-1)+"}"+line.substr(bottomEnd+1);
 }
-template<typename Output> static Output camDisplayCodeFences(const char* input,size_t length) {
-  Output out;out.reserve(length);bool fenced=false,math=false,plain=false;char marker=0;size_t fenceLength=0;
+template<typename Output> static Output camDisplayCodeFences(const char* input,size_t length,unsigned depth=0) {
+  Output out;out.reserve(length);bool fenced=false,math=false,plain=false,unwrappedMarkdown=false;char marker=0;size_t fenceLength=0;
   for(size_t at=0;at<length;) {
     size_t end=at;while(end<length && input[end]!='\n')++end;
     const std::string line(input+at,end-at);size_t first=line.find_first_not_of(" \t\r");
@@ -229,7 +274,9 @@ template<typename Output> static Output camDisplayCodeFences(const char* input,s
         fenced=true;marker=line[first];fenceLength=run-first;
         std::string label=line.substr(run);size_t last=label.find_last_not_of(" \t\r");if(last==std::string::npos)label.clear();else label.resize(last+1);
         size_t start=label.find_first_not_of(" \t");if(start!=std::string::npos)label.erase(0,start);
-        math=label=="math" || label=="latex" || label=="tex";
+        const bool markdown=label=="markdown" || label=="md";
+        unwrappedMarkdown=unwrappedMarkdown || markdown;
+        math=label=="math" || label=="latex" || label=="tex" || markdown;
         plain=label.empty() || label=="text" || label=="plaintext";
       } else fenced=false;
     }else {
@@ -239,5 +286,5 @@ template<typename Output> static Output camDisplayCodeFences(const char* input,s
     }
     at=end<length?end+1:end;
   }
-  return out;
+  return unwrappedMarkdown && depth<3 ? camDisplayCodeFences<Output>(out.c_str(),out.length(),depth+1) : out;
 }

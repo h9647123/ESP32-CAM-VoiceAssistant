@@ -93,7 +93,7 @@ static void camVideoLeave() {
 static void camVideoStart() {
   if(!camPhotoOnly || camPhotoStage!=CamPhotoStage::Preview || !camSdReady)return;
   const uint32_t initStarted=millis();
-  if(!camAcquireModelTransport())return;
+  cancelServiceProbe(); // Local recording does not need the network transport.
   camRefreshSdUsage(!camSdUsageValid);
   const uint32_t usageDone=millis();
   if(!camSdUsageValid || camSdTotalBytes-camSdUsedBytes<4*1024*1024) {
@@ -182,6 +182,8 @@ static bool camVideoHandleKey(char key,bool click,bool longPress,bool released) 
       const auto action=camMediaDelete.action(key,click,longPress);
       if(action==CamMediaDeleteState::Action::Cancel) {
         camMediaDeleteClose();camVideoLibraryDraw();camViewSprite.pushSprite(0,0);camVideoLoad();
+      } else if(action==CamMediaDeleteState::Action::Advance) {
+        ++buttonUiGeneration;camMediaDeleteDraw();
       } else if(action==CamMediaDeleteState::Action::Confirm) {
         const bool targetValid=camVideoIndex<camVideoItems.size() &&
             camMediaDelete.matches(true,camVideoIndex,camVideoItems[camVideoIndex].path.c_str());

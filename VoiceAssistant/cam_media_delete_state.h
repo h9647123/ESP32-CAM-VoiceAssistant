@@ -34,16 +34,11 @@ struct CamMediaDeleteState {
     if (!active) return Action::Waiting;
     if(key=='A' && longPress)return Action::Cancel;
     if(!click || longPress)return Action::Waiting;
-    if(video) { // Preserve the existing video confirmation behavior.
-      if(key=='B' || key=='C')return Action::Cancel;
-      if(key=='A')return Action::Confirm;
-    }else {
-      if(key=='C')return Action::Cancel;
-      if(!finalConfirm) {
-        if(key=='B')return Action::Hide;
-        if(key=='A'){finalConfirm=true;return Action::Advance;}
-      }else if(key=='B')return Action::Confirm;
-    }
+    if(key=='C')return Action::Cancel;
+    if(!finalConfirm) {
+      if(key=='B')return video?Action::Cancel:Action::Hide;
+      if(key=='A'){finalConfirm=true;return Action::Advance;}
+    }else if(key=='B')return Action::Confirm;
     return Action::Waiting;
   }
 };

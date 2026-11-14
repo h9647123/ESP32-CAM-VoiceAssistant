@@ -29,7 +29,7 @@ static int scienceScriptWidth(const String& text, bool compact=false) {
 }
 
 static void drawScienceText(LGFX_Sprite* sprite, int x, int y, const String& text,
-                            uint16_t color, bool bold, float scale=1.0f) {
+                            uint16_t color, bool bold, float scale=1.0f,bool italic=false) {
   lgfx::LGFXBase& target = sprite ? static_cast<lgfx::LGFXBase&>(*sprite)
                                 : static_cast<lgfx::LGFXBase&>(tft);
   int cursor = x, previousAdvance = 16;
@@ -44,15 +44,17 @@ static void drawScienceText(LGFX_Sprite* sprite, int x, int y, const String& tex
   };
   for (size_t at = 0; at < text.length();) {
     const size_t len = utf8CharLen(text, at);
-    const ScienceGlyph* glyph = scienceGlyph(utf8DecodeAt(text, at, len));
+    const uint32_t cp=utf8DecodeAt(text, at, len);
+    const ScienceGlyph* glyph = cp<128 && !italic ? nullptr : scienceGlyph(cp);
     if (glyph) {
       flush();
       const int gx = glyph->advance ? cursor : cursor - previousAdvance + (previousAdvance - 16) / 2;
       for (int row = 0; row < 16; ++row) {
         const uint16_t bits = glyph->rows[row];
         for (int col = 0; col < 16; ++col) if (bits & (0x8000 >> col)) {
-          target.fillRect(gx+int(col*scale),y+int(row*scale),max(1,int((col+1)*scale)-int(col*scale)),max(1,int((row+1)*scale)-int(row*scale)),color);
-          if (bold && col < 15) target.drawPixel(gx+int(col*scale)+1,y+int(row*scale),color);
+          const int shift=italic?(15-row)/6:0;
+          target.fillRect(gx+int((col+shift)*scale),y+int(row*scale),max(1,int((col+1)*scale)-int(col*scale)),max(1,int((row+1)*scale)-int(row*scale)),color);
+          if (bold && col < 15) target.drawPixel(gx+int((col+shift)*scale)+1,y+int(row*scale),color);
         }
       }
       if (glyph->advance) previousAdvance = glyph->advance;

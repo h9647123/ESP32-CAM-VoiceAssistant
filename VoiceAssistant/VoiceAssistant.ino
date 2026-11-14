@@ -1,3 +1,4 @@
+#include "cam_json_config.h"
 #if __has_include("config.h")
 #include "config.h"
 #endif
@@ -197,6 +198,7 @@
 #include "iat_endpoint.h"
 #include "buffered_mic.h"
 #include "asr_capture_limits.h"
+#include "cam_iat_stream.h"
 #include "service_probe_policy.h"
 #include <lwip/sockets.h>
 #include <lwip/tcp.h>
@@ -214,6 +216,10 @@
 #include "cam_tls.h"
 #include "cam_strict_json.h"
 #include "cam_json_memory.h"
+#include "cam_history_io.h"
+#include "cam_draft_edit.h"
+static CamDraftEraseGesture draftEraseGesture;
+#include "cam_llm_policy.h"
 #include "cam_http_ui.h"
 #include "cam_capture.h"
 #include "iat_dns_fallback.h"
@@ -347,9 +353,9 @@ static constexpr size_t LLM_SEARCH_DIRECT_ANSWER_MAX_BYTES = 4096;
 // MAX_HISTORY_BYTES because it depends on that cap.  With PSRAM enabled the
 // whole 150 KB session can be sent, and `contextlimit` lowers it when a smaller
 // request is preferable for latency or token cost.
-static const char* APP_VERSION = "v0.4.26-cam";
+static const char* APP_VERSION = "v0.4.31-cam";
 static const char* APP_SIGNATURE = "BYHCL-CAM";
-static const char* APP_BUILD_DATE = "2026-11-07";
+static const char* APP_BUILD_DATE = "2026-11-14";
 
 // The screen RES shares EN and cannot be pulsed independently by this MCU.
 // Start each initialization from a defined controller state even when only the
@@ -506,12 +512,7 @@ enum class UiPage {
 };
 enum class CamPhotoStage { Off, Preview, Review, Album, VideoAlbum, Decision };
 
-enum class SearchMode : uint8_t {
-  Off = 0,
-  On = 1,
-  Auto = 2,
-  Agent = 3
-};
+#include "cam_search_mode.h"
 
 enum class AsrProvider : uint8_t {
   Volc = 0,
@@ -580,6 +581,7 @@ static bool camPhotoOnly = false;
 static bool camVisionRequestActive=false;
 static std::atomic<bool> camVisionCancelRequested{false};
 static bool camStreamRevealSkipRequested=false,chatStreamRendering=false;
+static uint32_t chatRenderRevision=1;
 static uint32_t camVisionRequestStarted=0;
 static bool camVideoRecording = false, camVideoPlaying = false;
 static String camVideoNotice;
@@ -672,6 +674,7 @@ struct RuntimeConfig {
   size_t llmContextMaxBytes;
   SearchMode searchMode;
   bool enableThinking;
+  uint8_t deepseekThinkingLevel=2;
   bool showThinking;
   uint8_t currentSession;
   bool clockMode;
@@ -792,6 +795,9 @@ static std::vector<size_t> chatRoundStarts;
 static uint32_t chatRoundJumpAt=0;
 uint32_t chatScrollHoldLastAt = 0;
 int8_t chatScrollHoldDir = 0;
+#include "cam_scroll_motion.h"
+uint32_t chatScrollHoldRemainder=0,chatScrollFrameRemainder=0;
+uint32_t chatScrollFrames=0,chatScrollMaxDrawMs=0,chatScrollMaxFrameMs=0;
 int16_t chatScrollbarLastThumbY = -1;
 int16_t chatScrollbarLastThumbH = -1;
 UiPage uiPage = UiPage::Page1;
@@ -900,11 +906,18 @@ class PsramString {
 
   size_t length() const { return len_; }
   bool isEmpty() const { return len_ == 0; }
-  bool append(const char* bytes,size_t count) {
+  size_t size() const{return len_;}bool empty()const{return !len_;}
+  bool endsWith(const String& suffix)const{return suffix.length()<=len_ && !memcmp(c_str()+len_-suffix.length(),suffix.c_str(),suffix.length());}
+  size_t find(const char* needle)const{const char* p=strstr(c_str(),needle);return p?size_t(p-c_str()):size_t(-1);}
+  int indexOf(const char* needle)const{const size_t p=find(needle);return p==size_t(-1)?-1:int(p);}
+  bool operator==(const String& other)const{return len_==other.length()&&!memcmp(c_str(),other.c_str(),len_);}
+  void trim(){auto space=[](char c){return c==' '||c=='\t'||c=='\r'||c=='\n'||c=='\v'||c=='\f';};size_t first=0,last=len_;while(first<last&&space(data_[first]))++first;while(last>first&&space(data_[last-1]))--last;if(first&&last>first)memmove(data_,data_+first,last-first);len_=last-first;if(data_)data_[len_]=0;}
+
+  bool append(const char* bytes,size_t count,size_t limit=65536) {
     if(!count)return true;
-    if(count>65536 || len_>65536-count)return false;
+    if(count>limit || len_>limit-count)return false;
     if(len_+count+1>capacity_) {
-      const size_t nextCapacity=max(len_+count+1,min<size_t>(65537,max<size_t>(1024,capacity_*2)));
+      const size_t nextCapacity=max(len_+count+1,min<size_t>(limit+1,max<size_t>(1024,capacity_*2)));
       char* next=static_cast<char*>(heap_caps_malloc(nextCapacity,psramFound()?(MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT):MALLOC_CAP_8BIT));
       if(!next)return false;
       if(data_)memcpy(next,data_,len_);if(data_)free(data_);data_=next;capacity_=nextCapacity;
@@ -1053,6 +1066,7 @@ static String camVideoSizeText();
 static bool camAlbumHandleKey(char key, bool click, bool longPress);
 static void drawChatWindowAtPixel(int32_t scrollPixels);
 static void scrollChat(int delta, bool fast = false);
+static void camScrollBench();
 static void updateChatScrollAnimation();
 static void stopChatScrollHold();
 static String chatScrollStatusText(int32_t scrollPixels);
@@ -1904,9 +1918,11 @@ static void loadRuntimeConfig() {
     cfg.llmContextMaxBytes = MAX_HISTORY_LOAD_BYTES;
   }
   if (cfg.llmContextMaxBytes < 1024) cfg.llmContextMaxBytes = 1024;
-  cfg.searchMode = SearchMode(runtimePrefs.getUChar("search_mode", uint8_t(SearchMode::Off)));
-  if (uint8_t(cfg.searchMode) > uint8_t(SearchMode::Agent)) cfg.searchMode = SearchMode::Off;
+  const uint8_t storedSearchMode=runtimePrefs.getUChar("search_mode",0);
+  cfg.searchMode=camNormalizeSearchMode(storedSearchMode);
+  if(storedSearchMode!=uint8_t(cfg.searchMode))runtimePrefs.putUChar("search_mode",uint8_t(cfg.searchMode));
   cfg.enableThinking = runtimePrefs.getBool("enable_thinking", false);
+  cfg.deepseekThinkingLevel=min<uint8_t>(3,max<uint8_t>(1,runtimePrefs.getUChar("ds_effort",2)));
   cfg.showThinking = runtimePrefs.getBool("show_thinking", false);
   cfg.currentSession = runtimePrefs.getUChar("session", 1);
   cfg.currentSession = constrain(cfg.currentSession, 1, SESSION_COUNT);
@@ -1967,7 +1983,7 @@ static void applyChatLayout() {
     chatSprite.deleteSprite();
     chatSpriteReady = false;
   }
-  chatSprite.setColorDepth(8);
+  chatSprite.setPsram(true);chatSprite.setColorDepth(16); // Preserve neutral gray without RGB332 blue quantization.
   chatSpriteReady = chatSprite.createSprite(CHAT_AREA_WIDTH, CHAT_AREA_HEIGHT);
   if (!chatSpriteReady) {
     Serial.println("[UI] chat sprite allocation failed; using direct draw");
@@ -2050,19 +2066,17 @@ static void buildChatRollingSummary() {
   size_t seen = 0;
   String digest;
   while (f.position() < chatHistoryPrefixBytes && f.available()) {
-    String line = f.readStringUntil('\n');
-    line.trim();
-    if (!line.length()) continue;
-    ++seen;
-    JsonDocument doc;
-    if (deserializeJson(doc, line)) continue;
+    CamHistoryLineReader<File> row(f,MAX_HISTORY_BYTES*6+4096);JsonDocument doc(&camJsonAllocator);
+    const auto error=deserializeJson(doc,row);const bool complete=row.finish();
+    if(!row.hasData)continue;++seen;if(error || !complete)continue;
     if(doc["web_evidence"].is<String>()) {
       chatRollingWebEvidence=truncateUtf8ToBytes(doc["web_evidence"].as<String>(),2400);
       chatRollingWebTrace=truncateUtf8ToBytes(doc["web_trace"].as<String>(),1200);
     }
     if (seen % kSampleEvery != 1) continue;
     String role = doc["role"].as<String>();
-    String content = doc["content"].as<String>();
+    const char* raw=doc["content"] | "";
+    char sample[kClipChars+5]={};strncpy(sample,raw,kClipChars+4);String content(sample);
     content.replace("\n", " ");
     // Clip on a UTF-8 boundary: substring() counts bytes, so a plain cut can
     // split a multi-byte character, and the resulting invalid UTF-8 made the
@@ -2090,7 +2104,7 @@ static String chatClearedRuntimeKey() {
 }
 
 static void markChatLinesDirty() {
-  chatLinesDirty = true;
+  chatLinesDirty = true;++chatRenderRevision;
 }
 
 static void refreshChatDisplayConfig() {
@@ -2103,7 +2117,7 @@ static void refreshChatDisplayConfig() {
 
 static bool initFileSystem() {
   if (fsReady) return true;
-  fsReady = SPIFFS.begin(true);
+  fsReady = SPIFFS.begin(false);
   if (!fsReady) {
     Serial.println("[FS] SPIFFS mount failed");
     lastError = "SPIFFS mount failed";
@@ -2217,7 +2231,7 @@ static void chatHistoryLoadProgress(size_t at,size_t total) {
 static void loadChatHistory() {
   chatHistoryLoadProgress(0,0);
   chatHistory.clear();
-  camLastSearchSources="";
+  camLastSearchSources="";chatHistoryUnsaved=false;chatStorageNotice=false;
   chatHistoryBytes = 0;
   chatHistoryReadIncomplete = false;
   bool historySanitized = false;
@@ -2232,8 +2246,8 @@ static void loadChatHistory() {
       return;
     }
     if (cfg.currentSession == 1 && loadLegacyNvsChatHistory()) {
-      saveChatHistory();
-      clearLegacyNvsChatHistory();
+      if(saveChatHistory())clearLegacyNvsChatHistory();
+      else Serial.println("[ChatHist] migration failed; legacy retained");
     }
     return;
   }
@@ -2245,37 +2259,30 @@ static void loadChatHistory() {
   }
   const size_t fileSize = f.size();
   chatHistoryPrefixBytes = 0;
-  if (fileSize > MAX_HISTORY_LOAD_BYTES) {
-    const size_t skipBytes = fileSize - MAX_HISTORY_LOAD_BYTES;
-    Serial.printf("[ChatHist] %s is %u bytes; keeping newest %u\n", path.c_str(),
-                  unsigned(fileSize), unsigned(MAX_HISTORY_LOAD_BYTES));
-    if (f.seek(skipBytes)) {
-      // Drop the remainder of the partially-skipped line so the first record
-      // parsed is a complete JSON object, and remember where the kept region
-      // starts so saveChatHistory() can copy the prefix through untouched.
-      while (f.available() && f.read() != '\n') {
-      }
-      chatHistoryPrefixBytes = f.position();
-    } else {
-      Serial.println("[ChatHist] seek failed; loading from the start");
-    }
+  if(!camHistoryWindowStart(f,MAX_HISTORY_LOAD_BYTES,chatHistoryPrefixBytes)) {
+    f.close();chatHistoryReadIncomplete=true;chatStorageFailure();return;
   }
   std::vector<size_t> recordEnds;
   while (f.available()) {
     chatHistoryLoadProgress(f.position(),fileSize);
-    String line = f.readStringUntil('\n');
-    line.trim();
-    if (!line.length()) continue;
-    JsonDocument doc;
-    DeserializationError err = deserializeJson(doc, line);
-    if (err) {
-      chatHistoryReadIncomplete = true;
-      Serial.printf("[ChatHist] line parse error: %s\n", err.c_str());
-      continue;
+    CamHistoryLineReader<File> row(f,MAX_HISTORY_BYTES*6+4096);
+    JsonDocument doc(&camJsonAllocator);
+    const DeserializationError err=deserializeJson(doc,row);
+    const bool rowComplete=row.finish();
+    if(!row.hasData && !row.overflow)continue;
+    if(err || !rowComplete || doc.overflowed()) {
+      chatHistoryReadIncomplete=true;
+      Serial.printf("[ChatHist] record read failure at=%u kind=%s complete=%d\n",unsigned(f.position()),err.c_str(),rowComplete);continue;
     }
     ChatMsg m;
     m.role = doc["role"].as<String>();
-    m.content = doc["content"].as<String>();
+    const JsonString storedContent=doc["content"].as<JsonString>();
+    const char* rawContent=storedContent.c_str()?storedContent.c_str():"";
+    if(strlen(rawContent)!=storedContent.size() || !camHistoryUtf8Valid(rawContent,storedContent.size())) {
+      chatHistoryReadIncomplete=true;Serial.println("[ChatHist] invalid content retained on disk; save blocked");continue;
+    }
+    m.content=rawContent;
+    if(m.content.length()!=storedContent.size()){chatHistoryReadIncomplete=true;continue;}
     camLoadImageReferences(m,doc["images"].as<JsonArrayConst>());
     if(m.role=="user") {
       if(doc["web_evidence"].is<String>())m.webEvidence=truncateUtf8ToBytes(doc["web_evidence"].as<String>(),2400);
@@ -2284,7 +2291,7 @@ static void loadChatHistory() {
     bool roleSanitized = false;
     bool contentSanitized = false;
     m.role = sanitizeUtf8(m.role, &roleSanitized);
-    m.content = sanitizeUtf8(m.content, &contentSanitized);
+    // Content was validated without materializing a large internal-RAM String.
     historySanitized = historySanitized || roleSanitized || contentSanitized;
     if (m.role!="user" && m.role!="assistant" && m.role!="system") {
       chatHistoryReadIncomplete=true;continue;
@@ -2328,6 +2335,7 @@ static void loadChatHistory() {
     clearChatRollingSummary();
   }
   if(!camLastSearchSources.length() && chatRollingWebEvidence.length())camLastSearchSources=String(chatRollingWebEvidence);
+  if(chatHistoryReadIncomplete)chatStorageFailure();
 }
 
 static bool saveChatHistory() {
@@ -2336,7 +2344,7 @@ static bool saveChatHistory() {
     Serial.println("[ChatHist] save refused: incomplete/corrupt load; original archive retained");
     return chatStorageFailure();
   }
-  if (!chatStorageReady()) return false;
+  if (!chatStorageReady()) return chatStorageFailure();
   String path = chatHistoryPath();
   if (!chatRecoverFile(chatStore(),path)) return chatStorageFailure();
   // When the previous load skipped an oversized prefix, that prefix is still on
@@ -2349,7 +2357,7 @@ static bool saveChatHistory() {
   bool writesOk=true;size_t expected=0;
   if (!out) {
     Serial.println("[ChatHist] failed to write " + path);
-    return false;
+    return chatStorageFailure();
   }
   bool prefixCopied = true;
   if (preservePrefix) {
@@ -2374,17 +2382,17 @@ static bool saveChatHistory() {
       Serial.println("[ChatHist] prefix copy failed; keeping the original file");
       out.close();
       chatStore().remove(tempPath);
-      return false;
+      return chatStorageFailure();
     }
   }
   std::vector<size_t> committedEnds;committedEnds.reserve(chatHistory.size());
   for (auto& m : chatHistory) {
-    JsonDocument doc;
+    JsonDocument doc(&camJsonAllocator);
     doc["role"] = m.role;
-    doc["content"] = m.content;
+    doc["content"] = m.content.c_str();
     if(m.thinkingTimed){doc["thinking_ms"]=m.thinkingMs;doc["thinking_complete"]=m.thinkingComplete;}
-    if(m.webEvidence.length())doc["web_evidence"]=m.webEvidence;
-    if(m.webTrace.length())doc["web_trace"]=m.webTrace;
+    if(m.webEvidence.length())doc["web_evidence"]=m.webEvidence.c_str();
+    if(m.webTrace.length())doc["web_trace"]=m.webTrace.c_str();
     if(!m.images.empty()) {
       JsonArray images=doc["images"].to<JsonArray>();
       for(const auto& image:m.images) {JsonObject item=images.add<JsonObject>();item["path"]=image.path;item["bytes"]=image.bytes;}
@@ -2400,6 +2408,7 @@ static bool saveChatHistory() {
   writesOk=writesOk && verify && verify.size()==expected;verify.close();
   if (!writesOk) {chatStore().remove(tempPath);return chatStorageFailure();}
   if (!chatCommitFile(chatStore(),path)) return chatStorageFailure();
+  chatHistoryUnsaved=false;chatStorageNotice=false;
   for(size_t i=0;i<chatHistory.size();++i)chatHistory[i].diskEnd=committedEnds[i];
   Serial.printf("[ChatHist] saved %d messages (%u bytes) to %s\n",
                 int(chatHistory.size()), unsigned(chatHistoryBytes), path.c_str());
@@ -2427,6 +2436,13 @@ static void updateChatMessageContent(size_t index, const String& content,
   if (markDirty) markChatLinesDirty();
 }
 
+static bool camStorePsramMessage(size_t index,const PsramString& content,bool dirty=true) {
+  if(index>=chatHistory.size())return false;
+  PsramString next(content);if(next.length()!=content.length()){lastError="PSRAM answer allocation failed";return false;}
+  chatHistoryBytes-=chatHistory[index].content.length();chatHistory[index].content=std::move(next);
+  chatHistory[index].diskEnd=0;chatHistoryBytes+=chatHistory[index].content.length();if(dirty)markChatLinesDirty();return true;
+}
+
 static void removeChatMessage(size_t index) {
   if (index >= chatHistory.size()) return;
   chatHistoryBytes -= chatHistory[index].role.length()
@@ -2442,6 +2458,8 @@ static void switchSession(uint8_t session) {
   if ((session>INTERNAL_SESSION_COUNT && !incomingCard.length()) || (!chatHistoryReadIncomplete && !saveChatHistory())) {
     chatStorageFailure();if (uiPage==UiPage::Page2) drawPage2();return;
   }
+  stopChatScrollHold();chatRoundChordDir=0;chatRoundChordLatched=false;
+  ++buttonUiGeneration; // Discard repeats queued while the old session was loading.
   camReleasePhoto(); // A hot photo must never leak into a different chat session.
   composingQuestion = false;
   pendingQuestion = "";
@@ -2478,7 +2496,7 @@ static bool clearChatHistory() {
   if (!ok || !chatCommitFile(chatStore(),path)) return chatStorageFailure();
   writeChatClearMarker();clearLegacyNvsChatHistory();
   transientSearchResult="";chatHistory.clear();chatHistoryBytes=0;chatHistoryPrefixBytes=0;
-  chatHistoryReadIncomplete=false;
+  chatHistoryReadIncomplete=false;chatHistoryUnsaved=false;chatStorageNotice=false;
   clearChatRollingSummary();saveChatRollingSummary();markChatLinesDirty();
   Serial.println("[ChatHist] cleared");return true;
 }
@@ -2625,6 +2643,7 @@ static void saveRuntimeConfig() {
   runtimePrefs.putULong("llm_ctx_max", uint32_t(cfg.llmContextMaxBytes));
   runtimePrefs.putUChar("search_mode", uint8_t(cfg.searchMode));
   runtimePrefs.putBool("enable_thinking", cfg.enableThinking);
+  runtimePrefs.putUChar("ds_effort",cfg.deepseekThinkingLevel);
   runtimePrefs.putBool("show_thinking", cfg.showThinking);
   runtimePrefs.putUChar("session", cfg.currentSession);
   runtimePrefs.putBool("clock_mode", cfg.clockMode);
@@ -2813,6 +2832,7 @@ static void addRuntimeConfigJson(JsonDocument& doc, bool includeSecrets) {
   r["llm_context_max_bytes"] = uint32_t(cfg.llmContextMaxBytes);
   r["search_mode"] = uint8_t(cfg.searchMode);
   r["enable_thinking"] = cfg.enableThinking;
+  r["deepseek_thinking_level"] = cfg.deepseekThinkingLevel;
   r["show_thinking"] = cfg.showThinking;
   r["current_session"] = cfg.currentSession;
   r["clock_mode"] = cfg.clockMode;
@@ -2938,9 +2958,10 @@ static bool applyRuntimeConfigJson(JsonDocument& doc, String& report) {
     }
   }
   if (!r["search_mode"].isNull()) {
-    cfg.searchMode = SearchMode(constrain(r["search_mode"].as<int>(), 0, 3));
+    cfg.searchMode = camNormalizeSearchMode(r["search_mode"].as<int>());
   }
   copyBoolIfPresent(r, "enable_thinking", cfg.enableThinking);
+  if(r["deepseek_thinking_level"].is<unsigned>())cfg.deepseekThinkingLevel=min<unsigned>(3,max<unsigned>(1,r["deepseek_thinking_level"].as<unsigned>()));
   copyBoolIfPresent(r, "show_thinking", cfg.showThinking);
   copyUCharIfPresent(r, "current_session", cfg.currentSession);
   copyBoolIfPresent(r, "clock_mode", cfg.clockMode);
@@ -3255,16 +3276,13 @@ static String hmacSha1Base64(const String& key, const String& data) {
 }
 
 static String searchModeText(SearchMode mode) {
-  if (mode == SearchMode::Agent) return "AGENT";
-  if (mode == SearchMode::On) return "ON";
   if (mode == SearchMode::Auto) return "AUTO";
   return "OFF";
 }
 
 static void cycleSearchMode(int delta) {
-  int value = int(uint8_t(cfg.searchMode));
-  value = (value + delta + 4) % 4;
-  cfg.searchMode = SearchMode(value);
+  cfg.searchMode=camNormalizeSearchMode(int(cfg.searchMode));
+  if(delta%2)cfg.searchMode=cfg.searchMode==SearchMode::Off?SearchMode::Auto:SearchMode::Off;
   saveRuntimeConfig();
 }
 
@@ -3398,7 +3416,7 @@ static void printHelp() {
   Serial.println(F("  searchurl <url>|clear             Search endpoint (default Tavily)"));
   Serial.println(F("  lanpin <host> <ip> | lanpin clear Route a hostname to a LAN address"));
   Serial.println(F("  tavily key <api_key>|clear        Save or clear search API key"));
-  Serial.println(F("  tavily off|on|auto|agent|status   Set or inspect search mode"));
+  Serial.println(F("  searchmode off|auto|status       Set or inspect search mode"));
   Serial.println(F("  search <query> | search clear      Search or clear temporary preview"));
   Serial.println();
   Serial.println(F("  clock on|off                      Toggle clock page"));
@@ -3604,6 +3622,7 @@ static String llmTimeContext() {
   return context;
 }
 
+#include "cam_rich_styles.h"
 static const char RICH_BOLD_TOGGLE = '\x01';
 static const char RICH_HEADING_TOGGLE = '\x02';
 static const char RICH_THINKING_TOGGLE = '\x03';
@@ -3727,6 +3746,8 @@ static String normalizeRichText(const String& input) {
   out.reserve(text.length() + 8);
   bool boldOpen = false;
   bool headingOpen = false;
+  bool italicOpen=false,strikeOpen=false;
+  char headingMarker=RICH_HEADING_TOGGLE;
   bool codeOpen = false;
   bool atLineStart = true;
   bool mathOpen=false;
@@ -3743,7 +3764,7 @@ static String normalizeRichText(const String& input) {
         boldOpen = false;
       }
       if (headingOpen) {
-        out += RICH_HEADING_TOGGLE;
+        out += headingMarker;
         headingOpen = false;
       }
       out += RICH_THINKING_TOGGLE;
@@ -3787,7 +3808,7 @@ static String normalizeRichText(const String& input) {
       if (ch == '\n') {
         if (headingOpen) {
           out.remove(out.length() - 1);
-          out += RICH_HEADING_TOGGLE;
+          out += headingMarker;
           out += '\n';
           headingOpen = false;
         }
@@ -3805,6 +3826,12 @@ static String normalizeRichText(const String& input) {
       size_t next = i;
       if (latexDisplayToken(text.c_str(), text.length(), next, rendered)) {
         out += rendered.c_str(); i = next; atLineStart = false; continue;
+      }
+    }
+    if(text[i]=='^') {
+      size_t next=i+1;std::string degree;
+      if(latexArgument(text.c_str(),text.length(),next,degree,0) && latexDisplayContent(degree,0)=="°") {
+        out+="°";i=next;continue; // Degree mark is not an exponent or a literal caret.
       }
     }
     if(text[i]=='$' && (mathOpen || text.indexOf('$',i+1)>=0)) {
@@ -3829,6 +3856,12 @@ static String normalizeRichText(const String& input) {
     if (atLineStart) {
       size_t j = i;
       while (j < text.length() && (text[j] == ' ' || text[j] == '\t')) j++;
+      if(j<text.length() && text[j]=='>') {
+        unsigned depth=0;
+        while(j<text.length() && text[j]=='>' && depth<3){++depth;++j;while(j<text.length() && text[j]==' ')++j;}
+        for(unsigned n=0;n<depth;++n)out+=RICH_QUOTE_BAR;
+        i=j;atLineStart=false;continue;
+      }
       uint8_t hashes = 0;
       while (j + hashes < text.length() && hashes < 6 && text[j + hashes] == '#') hashes++;
       const size_t headingText = j + hashes;
@@ -3838,7 +3871,8 @@ static String normalizeRichText(const String& input) {
            text[headingText] == '\r' || text[headingText] == '\n');
       if (hashes > 0 && headingSeparator) {
         if (j > i) out += text.substring(i, j);
-        out += RICH_HEADING_TOGGLE;
+        headingMarker=hashes==1?RICH_HEADING_TOGGLE:RICH_SUBHEADING_TOGGLE;
+        out += headingMarker;
         headingOpen = true;
         i = headingText;
         while (i < text.length() && (text[i] == ' ' || text[i] == '\t')) i++;
@@ -3852,6 +3886,19 @@ static String normalizeRichText(const String& input) {
       i += 2;
       atLineStart = false;
       continue;
+    }
+    if(i+1<text.length() && text[i]=='~' && text[i+1]=='~') {
+      out+=RICH_STRIKE_TOGGLE;strikeOpen=!strikeOpen;i+=2;continue;
+    }
+    if(!mathOpen && text[i]=='*' && (italicOpen || (i+1<text.length() && text[i+1]!=' ' && text[i+1]!='\n' && text.indexOf('*',i+1)>=0))) {
+      out+=RICH_ITALIC_TOGGLE;italicOpen=!italicOpen;++i;atLineStart=false;continue;
+    }
+    if(!mathOpen && i+1<text.length() && text[i]=='_' && text[i+1]=='_' &&
+        (boldOpen || i==0 || !isalnum(uint8_t(text[i-1])))) {
+      out+=RICH_BOLD_TOGGLE;boldOpen=!boldOpen;i+=2;continue;
+    }
+    if(!mathOpen && text[i]=='_' && (italicOpen || ((i==0 || !isalnum(uint8_t(text[i-1]))) && text.indexOf('_',i+1)>=0))) {
+      out+=RICH_ITALIC_TOGGLE;italicOpen=!italicOpen;++i;continue;
     }
     if (atLineStart && (text[i] == '>' || text[i] == '-' || text[i] == '*')) {
       size_t j = i + 1;
@@ -3877,7 +3924,7 @@ static String normalizeRichText(const String& input) {
     if (ch == '\n') {
       if (headingOpen) {
         out.remove(out.length() - 1);
-        out += RICH_HEADING_TOGGLE;
+        out += headingMarker;
         out += '\n';
         headingOpen = false;
       }
@@ -3887,8 +3934,10 @@ static String normalizeRichText(const String& input) {
     }
   }
   if (codeOpen) out += RICH_CODE_TOGGLE;
+  if(italicOpen)out+=RICH_ITALIC_TOGGLE;
+  if(strikeOpen)out+=RICH_STRIKE_TOGGLE;
   if (boldOpen) out += RICH_BOLD_TOGGLE;
-  if (headingOpen) out += RICH_HEADING_TOGGLE;
+  if (headingOpen) out += headingMarker;
   return out;
 }
 
@@ -3918,7 +3967,7 @@ static bool lineHasThinkingVisibleText(const String& line) {
       ++i;
       continue;
     }
-    if (ch == RICH_BOLD_TOGGLE || ch == RICH_HEADING_TOGGLE) {
+    if (ch == RICH_BOLD_TOGGLE || ch == RICH_HEADING_TOGGLE || camRichDecoration(ch)) {
       ++i;
       continue;
     }
@@ -4107,6 +4156,7 @@ static bool richFractionSpan(const String& text,size_t at,String& top,String& bo
   top=a.c_str();bottom=b.c_str();end=next;return true;
 }
 static String richPlainText(const String& text) {
+  if(text.length()>2 && text[0]=='\x14')return richPlainText(text.substring(2));
   String out;
   out.reserve(text.length());
   bool codeOpen = false;
@@ -4173,10 +4223,12 @@ static String richPlainText(const String& text) {
 }
 
 static int richTextWidth(const String& text) {
+  if(text.length()>2 && text[0]=='\x14')return richTextWidth(text.substring(2));
   int width = 0; bool codeOpen = false,heading=false; String part;
   auto flush = [&]() { width += int(scienceTextWidth(makeDisplaySafe(part))*(heading?1.25f:1.0f)); part = ""; };
   for (size_t at = 0; at < text.length();) {
     const char ch = text[at];
+    if(camRichDecoration(ch)){flush();if(ch==RICH_QUOTE_BAR)width+=6;++at;continue;}
     if(ch=='\x0f'){flush();width+=atoi(text.c_str()+at+1);break;}
     if (ch == RICH_CODE_TOGGLE) { codeOpen = !codeOpen; ++at; continue; }
     if (ch == RICH_THINKING_TOGGLE) { codeOpen = false; ++at; continue; }
@@ -4186,8 +4238,7 @@ static int richTextWidth(const String& text) {
     String script; size_t end = at;
     String numerator,denominator;
     if(!codeOpen && richFractionSpan(text,at,numerator,denominator,end)) {
-      flush();const bool full=camFractionHasScripts(numerator.c_str()) || camFractionHasScripts(denominator.c_str());
-      width+=full?max(richTextWidth(numerator),richTextWidth(denominator))+4:max(scienceScriptWidth(numerator,true),scienceScriptWidth(denominator,true))+4;at=end;continue;
+      flush();width+=max(richTextWidth(numerator),richTextWidth(denominator))+4;at=end;continue;
     }
     if (!codeOpen && mathScriptSpan(text, at, script, end)) {
       flush();int scriptWidth=scienceScriptWidth(script);String other;size_t pairEnd=end;
@@ -4210,7 +4261,7 @@ static String stripDisplayMarkers(const String& text) {
   bool inThinking = false;
   for (size_t i = 0; i < text.length(); ++i) {
     char ch = text[i];
-    if (ch == RICH_BOLD_TOGGLE || ch == RICH_HEADING_TOGGLE) continue;
+    if (ch == RICH_BOLD_TOGGLE || ch == RICH_HEADING_TOGGLE || camRichDecoration(ch)) continue;
     if (ch == RICH_CODE_TOGGLE) continue;
     if (ch == RICH_THINKING_TOGGLE) {
       inThinking = !inThinking;
@@ -4543,10 +4594,23 @@ static void drawTextPiece(LGFX_Sprite* sprite, int x, int y,
 
 static void drawRichTextLine(LGFX_Sprite* sprite, int x, int y,
                              const String& text, uint16_t color) {
+  // Each formula is one logical block, rasterized in viewport-sized bands.
+  // Keep operators and both sides on the same axis; sprite clipping makes
+  // partially scrolled formulas safe without a large temporary framebuffer.
+  const bool formulaBlock=text.length()>2 && text[0]=='\x14';
+  lgfx::LGFXBase& formulaTarget=sprite?static_cast<lgfx::LGFXBase&>(*sprite):static_cast<lgfx::LGFXBase&>(tft);
+  int32_t clipX=0,clipY=0,clipW=0,clipH=0;
+  if(formulaBlock) {
+    formulaTarget.getClipRect(&clipX,&clipY,&clipW,&clipH);
+    const int top=max(int(clipY),y),bottom=min(int(clipY+clipH),y+22);
+    formulaTarget.setClipRect(clipX,top,clipW,max(0,bottom-top));
+  }
+  if(formulaBlock)y-=int(text[1]-'0')*22;
   bool bold = false;
   bool heading = false;
   bool thinking = false;
   bool codeOpen = false;
+  bool italic=false,strike=false,subheading=false;
   String part;
   int cursorX = x;
   UiStyle style = currentStyle();
@@ -4560,13 +4624,24 @@ static void drawRichTextLine(LGFX_Sprite* sprite, int x, int y,
     if (thinking) drawColor = style.thinking;
     if (!thinking && heading) drawColor = style.heading;
     if (!thinking && bold) drawColor = style.emphasis;
-    drawScienceText(sprite,cursorX,y+(heading?1:4),part,drawColor,bold || heading,heading?1.25f:1.0f);
-    cursorX += int(scienceTextWidth(part)*(heading?1.25f:1.0f));
+    if(!thinking && subheading)drawColor=style.heading;
+    const int advance=int(scienceTextWidth(part)*(heading?1.25f:1.0f));
+    drawScienceText(sprite,cursorX,y+(formulaBlock?15:(heading?1:4)),part,drawColor,bold || heading || subheading,heading?1.25f:1.0f,italic);
+    if(strike){if(sprite)sprite->drawFastHLine(cursorX,y+11,advance,drawColor);else tft.drawFastHLine(cursorX,y+11,advance,drawColor);}
+    cursorX += advance;
     part = "";
   };
 
-  for (size_t i = 0; i < text.length();) {
+  for (size_t i = formulaBlock?2:0; i < text.length();) {
     char ch = text[i];
+    if(camRichDecoration(ch)) {
+      flushPart();
+      if(ch==RICH_ITALIC_TOGGLE)italic=!italic;
+      else if(ch==RICH_STRIKE_TOGGLE)strike=!strike;
+      else if(ch==RICH_SUBHEADING_TOGGLE)subheading=!subheading;
+      else {if(sprite)sprite->fillRect(cursorX,y+2,1,18,color);else tft.fillRect(cursorX,y+2,1,18,color);cursorX+=6;}
+      ++i;continue;
+    }
     if (ch == RICH_BOLD_TOGGLE) {
       flushPart();
       bold = !bold;
@@ -4587,6 +4662,7 @@ static void drawRichTextLine(LGFX_Sprite* sprite, int x, int y,
       heading = false;
       codeOpen = false;
       thinking = !thinking;
+      italic=strike=subheading=false;
       ++i;
       continue;
     }
@@ -4616,6 +4692,14 @@ static void drawRichTextLine(LGFX_Sprite* sprite, int x, int y,
     }
     if(!codeOpen && richFractionSpan(text,i,numerator,denominator,scriptEnd)) {
       flushPart();const uint16_t c=thinking?style.thinking:color;
+      if(formulaBlock) {
+        const int nw=richTextWidth(numerator),dw=richTextWidth(denominator);
+        const int width=max(nw,dw)+4;
+        drawRichTextLine(sprite,cursorX+(width-nw)/2,y,numerator,c);
+        drawRichTextLine(sprite,cursorX+(width-dw)/2,y+24,denominator,c);
+        if(sprite)sprite->drawFastHLine(cursorX,y+22,width,c);else tft.drawFastHLine(cursorX,y+22,width,c);
+        cursorX+=width;i=scriptEnd;continue;
+      }
       const int width=max(scienceScriptWidth(numerator,true),scienceScriptWidth(denominator,true))+4;
       drawScienceScript(sprite,cursorX+(width-scienceScriptWidth(numerator,true))/2,y,numerator,c,true);
       drawScienceScript(sprite,cursorX+(width-scienceScriptWidth(denominator,true))/2,y+12,denominator,c,true);
@@ -4626,11 +4710,11 @@ static void drawRichTextLine(LGFX_Sprite* sprite, int x, int y,
       flushPart();
       uint16_t drawColor = thinking ? style.thinking : (bold ? style.emphasis : color);
       const int scriptOffset = ch == '^' ? 0 : 11;
-      const int scriptY = y + scriptOffset;
+      const int scriptY = y + scriptOffset+(formulaBlock?11:0);
       drawScienceScript(sprite, cursorX, scriptY, script, drawColor);
       int advance=scienceScriptWidth(script);String other;size_t pairEnd=scriptEnd;
       if(scriptEnd<text.length() && text[scriptEnd]!=ch && mathScriptSpan(text,scriptEnd,other,pairEnd)) {
-        drawScienceScript(sprite,cursorX,y+(text[scriptEnd]=='^'?0:11),other,drawColor);
+        drawScienceScript(sprite,cursorX,y+(text[scriptEnd]=='^'?0:11)+(formulaBlock?11:0),other,drawColor);
         advance=max(advance,scienceScriptWidth(other));scriptEnd=pairEnd;
       }
       cursorX += advance;
@@ -4644,7 +4728,7 @@ static void drawRichTextLine(LGFX_Sprite* sprite, int x, int y,
     if (mapped.length()) {
       flushPart();
       uint16_t drawColor = thinking ? style.thinking : (bold ? style.emphasis : color);
-      const int mappedY = y + (yOffset?11:0);
+      const int mappedY = y + (yOffset?11:0)+(formulaBlock?11:0);
       drawScienceScript(sprite, cursorX, mappedY, mapped, drawColor);
       cursorX += scienceScriptWidth(mapped);
       i += len;
@@ -4654,17 +4738,42 @@ static void drawRichTextLine(LGFX_Sprite* sprite, int x, int y,
     i += len;
   }
   flushPart();
+  if(formulaBlock)formulaTarget.setClipRect(clipX,clipY,clipW,clipH);
 }
 
 static void wrapIntoLines(const String& text, int maxWidth,
                           std::vector<String>& out) {
-  String line;int lineWidth=0;bool bold=false,heading=false,thinking=false,code=false,visible=false;
+  String line;int lineWidth=0;bool bold=false,heading=false,thinking=false,code=false,visible=false,italic=false,strike=false,subheading=false;unsigned quotes=0;
   auto prefix=[&](){String p;if(thinking)p+=RICH_THINKING_TOGGLE;if(bold)p+=RICH_BOLD_TOGGLE;
-    if(heading)p+=RICH_HEADING_TOGGLE;if(code)p+=RICH_CODE_TOGGLE;return p;};
-  auto flush=[&](){out.push_back(line);line=prefix();lineWidth=0;visible=false;};
+    if(heading)p+=RICH_HEADING_TOGGLE;if(italic)p+=RICH_ITALIC_TOGGLE;if(strike)p+=RICH_STRIKE_TOGGLE;if(subheading)p+=RICH_SUBHEADING_TOGGLE;for(unsigned n=0;n<quotes;++n)p+=RICH_QUOTE_BAR;if(code)p+=RICH_CODE_TOGGLE;return p;};
+  auto emit=[&](){
+    bool block=false,scripts=false,literal=false;
+    for(size_t p=0;p<line.length();) {
+      if(line[p]==RICH_CODE_TOGGLE){literal=!literal;++p;continue;}
+      String a,b;size_t end=p;
+      if(!literal && richFractionSpan(line,p,a,b,end)) {
+        block=block || camFractionNeedsFullSize(a.c_str()) || camFractionNeedsFullSize(b.c_str());
+        scripts=scripts || camFractionHasScripts(a.c_str()) || camFractionHasScripts(b.c_str());p=end;
+      }else p+=utf8CharLen(line,p);
+    }
+    if(block) {
+      String spaced;
+      for(size_t p=0;p<line.length();) {
+        String a,b;size_t end=p;
+        if(richFractionSpan(line,p,a,b,end)){spaced+=line.substring(p,end);p=end;continue;}
+        const char ch=line[p];
+        if(ch=='=' || ch=='<' || ch=='>'){spaced+=' ';spaced+=ch;spaced+=' ';++p;}
+        else {const size_t n=utf8CharLen(line,p);spaced+=line.substring(p,p+n);p+=n;}
+      }
+      if(richTextWidth(spaced)<=maxWidth)line=spaced;
+      for(unsigned band=0;band<(scripts?3U:2U);++band)out.push_back(String('\x14')+String(char('0'+band))+line);
+    }else out.push_back(line);
+  };
+  auto flush=[&](){emit();line=prefix();lineWidth=quotes*6;visible=false;};
   for(size_t at=0;at<text.length();) {
     const char ch=text[at];
-    if(ch=='\n'){flush();++at;continue;}
+    if(camRichDecoration(ch)){line+=ch;++at;if(ch==RICH_ITALIC_TOGGLE)italic=!italic;else if(ch==RICH_STRIKE_TOGGLE)strike=!strike;else if(ch==RICH_SUBHEADING_TOGGLE)subheading=!subheading;else{++quotes;lineWidth+=6;}continue;}
+    if(ch=='\n'){flush();quotes=0;line=prefix();lineWidth=0;++at;continue;}
     if(ch==RICH_BOLD_TOGGLE || ch==RICH_HEADING_TOGGLE || ch==RICH_THINKING_TOGGLE || ch==RICH_CODE_TOGGLE) {
       line+=ch;++at;
       if(ch==RICH_BOLD_TOGGLE)bold=!bold;
@@ -4676,8 +4785,8 @@ static void wrapIntoLines(const String& text, int maxWidth,
     size_t end=at+utf8CharLen(text,at);String script,numerator,denominator;
     if(ch==RICH_LITERAL_ESCAPE && at+1<text.length())end=at+1+utf8CharLen(text,at+1);
     else if(!code && richFractionSpan(text,at,numerator,denominator,end)) {
-      const bool full=camFractionHasScripts(numerator.c_str()) || camFractionHasScripts(denominator.c_str());
-      if(full) {
+      const bool full=camFractionNeedsFullSize(numerator.c_str()) || camFractionNeedsFullSize(denominator.c_str());
+      if(full && richTextWidth(text.substring(at,end))>maxWidth) {
         if(visible)flush();
         std::vector<String> upper,lower;
         wrapIntoLines(prefix()+numerator,maxWidth,upper);wrapIntoLines(prefix()+denominator,maxWidth,lower);
@@ -4709,12 +4818,21 @@ static void wrapIntoLines(const String& text, int maxWidth,
         if(!depth && richTextWidth(prefix()+text.substring(at,next))<=maxWidth)end=next;
       }
     }
+    if(!code && ch>='A' && ch<='Z') {
+      size_t next=at;
+      while(next<text.length() && next-at<80) {
+        const unsigned char c=text[next];
+        if((c>='A'&&c<='Z')||(c>='a'&&c<='z')||(c>='0'&&c<='9')||c=='('||c==')'){++next;continue;}
+        String group;size_t stop=next;if(mathScriptSpan(text,next,group,stop)){next=stop;continue;}break;
+      }
+      if(next>end && richTextWidth(prefix()+text.substring(at,next))<=maxWidth)end=next;
+    }
     const String token=text.substring(at,end);
     const int tokenWidth=richTextWidth(prefix()+token);
     if(visible && lineWidth+tokenWidth>maxWidth)flush();
     line+=token;lineWidth+=tokenWidth;visible=true;at=end;
   }
-  if(visible)out.push_back(line);
+  if(visible)emit();
 }
 
 #include "cam_chat_thumbs.h"
@@ -4728,7 +4846,8 @@ static void appendChatMessageLines(const ChatMsg& msg,
         msg.thinkingActive?uiText("思考中 ","Thinking ","Thinking "):uiText("思考未完成 ","Thinking interrupted ","Thinking interrupted ");
     lines.push_back(prefix+label+String(msg.thinkingMs/1000)+"s");roles.push_back(4);prefix="";
   }
-  String visible = msg.content;
+  String visible=camHistoryDisplayText(msg.content.c_str(),msg.content.length(),cfg.showThinking,
+      uiText("（长思考已折叠，保留文本未删）","(Long thinking folded; original retained)","(Long thinking folded; original retained)"));
   if (msg.role == "assistant" && !cfg.showThinking) {
     visible = stripDisplayMarkers(visible);
   }
@@ -5519,7 +5638,7 @@ static bool connectWifiWith(const String& ssid, const String& password) {
   if(WiFi.status()==WL_CONNECTED && WiFi.SSID()==ssid)return true;
   WiFi.disconnect(false,false);delay(100);
   WiFi.begin(ssid.c_str(), password.c_str());
-  setState(AppState::Boot, uiText("正在连接 Wi-Fi","Connecting Wi-Fi","Connecting Wi-Fi"));
+  setState(AppState::Boot, uiText("正在连接“","Connecting to '","Connecting to '")+ssid+uiText("”","'","'"));
   Serial.printf("[WiFi] connecting to %s\n", ssid.c_str());
   uint32_t started = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - started < 20000) {
@@ -6036,7 +6155,7 @@ static bool sendRawWebSocketText(const uint8_t* data, size_t len) {
   const uint32_t random=esp_random();uint8_t mask[4];memcpy(mask,&random,4);
   memcpy(frame+at,mask,4);at+=4;
   for(size_t i=0;i<len;++i) frame[at+i]=data[i]^mask[i&3];
-  return writeAsrAll(frame,total);
+  return camRunHttpWithUi([&](){return writeAsrAll(frame,total)?1:0;})==1;
 }
 
 static bool sendXfyunAsrAudio(const uint8_t* data, size_t len, bool last) {
@@ -6364,7 +6483,7 @@ static void updateScrollbarThumb() {
   chatScrollbarLastThumbH = thumbH;
 }
 
-static UiStyle currentStyle() {
+static UiStyle themedStyle() {
   switch (constrain(cfg.uiStyle, 1, UI_STYLE_COUNT)) {
     case 2:
       return {tft.color565(120, 210, 225), tft.color565(150, 210, 255),
@@ -6407,6 +6526,7 @@ static UiStyle currentStyle() {
               tft.color565(90, 90, 90), TFT_WHITE};
   }
 }
+static UiStyle currentStyle(){UiStyle style=themedStyle();style.thinking=tft.color565(160,160,160);return style;}
 
 static String fitText(const String& text, int maxWidth) {
   if (maxWidth <= 0 || tft.textWidth(text) <= maxWidth) return text;
@@ -6623,6 +6743,7 @@ static void setChatScrollRow(size_t row) {
   chatScrollPixels = int32_t(row) * CHAT_LINE_HEIGHT;
   chatScrollTargetPixels = chatScrollPixels;
   chatScrollLastFrameAt = millis();
+  chatScrollHoldRemainder=chatScrollFrameRemainder=0;
 }
 
 static void drawChatWindowAtPixel(int32_t scrollPixels) {
@@ -6633,11 +6754,13 @@ static void drawChatWindowAtPixel(int32_t scrollPixels) {
 
   static String cachedLines[10];static uint8_t cachedRoles[10]={};
   static int32_t cachedPixel=-1;static int cachedTop=-1,cachedHeight=-1,cachedStyle=-1;
-  static size_t cachedCount=0;
+  static size_t cachedCount=0;static uint32_t cachedRevision=0;
+  struct RowRaster { LGFX_Sprite sprite;String text;uint8_t role=255;uint32_t revision=0;int style=-1;bool ready=false; };
+  static RowRaster rasters[10];
   size_t rowCount=0;
-  for(int rowY=4+yOffset;firstLine+rowCount<chatLines.size() && rowCount<CHAT_VISIBLE_LINES+2 && rowY<=CHAT_AREA_HEIGHT-CHAT_LINE_HEIGHT;rowY+=CHAT_LINE_HEIGHT)++rowCount;
+  for(int rowY=4+yOffset;firstLine+rowCount<chatLines.size() && rowCount<CHAT_VISIBLE_LINES+2 && rowY<CHAT_AREA_HEIGHT;rowY+=CHAT_LINE_HEIGHT)++rowCount;
   const bool reuse=chatStreamRendering && chatSpriteReady && !chatLines.empty() &&
-      cachedPixel==scrollPixels && cachedTop==CHAT_AREA_TOP && cachedHeight==CHAT_AREA_HEIGHT && cachedStyle==int(cfg.uiStyle) && cachedCount==rowCount && rowCount<=10;
+      cachedRevision==chatRenderRevision && cachedPixel==scrollPixels && cachedTop==CHAT_AREA_TOP && cachedHeight==CHAT_AREA_HEIGHT && cachedStyle==int(cfg.uiStyle) && cachedCount==rowCount && rowCount<=10;
   int dirtyTop=CHAT_AREA_HEIGHT,dirtyBottom=0;
   if (chatSpriteReady) {
     if(!reuse)chatSprite.fillSprite(TFT_BLACK);
@@ -6675,8 +6798,8 @@ static void drawChatWindowAtPixel(int32_t scrollPixels) {
   }
   for (size_t i = firstLine;
        i < chatLines.size() && i < firstLine + CHAT_VISIBLE_LINES + 2; ++i) {
-    if (y > CHAT_AREA_HEIGHT - CHAT_LINE_HEIGHT) break;
-    String line = chatLines[i];
+    if (y >= CHAT_AREA_HEIGHT) break; // Sprite clips partial entering/leaving rows.
+    const String& line = chatLines[i];
     uint8_t role = i < chatLineRoles.size() ? chatLineRoles[i] : 0;
     const size_t slot=i-firstLine;
     if(reuse && cachedLines[slot]==line && cachedRoles[slot]==role){y+=CHAT_LINE_HEIGHT;continue;}
@@ -6694,14 +6817,24 @@ static void drawChatWindowAtPixel(int32_t scrollPixels) {
     else if (role == 2) color = style.assistant;
     else if (role == 3) color = TFT_RED;
     else if (role == 4) color = style.thinking;
-    const int markerY = chatSpriteReady ? y + 3 : CHAT_AREA_TOP + y + 3;
-    if (chatSpriteReady) {
-      chatSprite.fillRoundRect(4, markerY, 4, 10, 2, color);
-    } else {
-      tft.fillRoundRect(4, markerY, 4, 10, 2, color);
+    bool drawn=false;
+    if(chatSpriteReady) {
+      auto& raster=rasters[i%10];
+      if(!raster.ready){raster.sprite.setPsram(true);raster.sprite.setColorDepth(16);raster.ready=raster.sprite.createSprite(CHAT_AREA_WIDTH,CHAT_LINE_HEIGHT)!=nullptr;}
+      if(raster.ready) {
+        if(raster.text!=line || raster.role!=role || raster.revision!=chatRenderRevision || raster.style!=int(cfg.uiStyle)) {
+          raster.sprite.fillSprite(TFT_BLACK);raster.sprite.setTextWrap(false);raster.sprite.setTextSize(1);raster.sprite.setFont(&fonts::efontCN_16);
+          raster.sprite.fillRoundRect(4,3,4,10,2,color);drawRichTextLine(&raster.sprite,14,0,line,color);
+          raster.text=line;raster.role=role;raster.revision=chatRenderRevision;raster.style=int(cfg.uiStyle);
+        }
+        raster.sprite.pushSprite(&chatSprite,0,y);drawn=true;
+      }
     }
-    drawRichTextLine(chatSpriteReady ? &chatSprite : nullptr, 14,
-                     chatSpriteReady ? y : CHAT_AREA_TOP + y, line, color);
+    if(!drawn) {
+      const int markerY=chatSpriteReady?y+3:CHAT_AREA_TOP+y+3;
+      if(chatSpriteReady)chatSprite.fillRoundRect(4,markerY,4,10,2,color);else tft.fillRoundRect(4,markerY,4,10,2,color);
+      drawRichTextLine(chatSpriteReady?&chatSprite:nullptr,14,chatSpriteReady?y:CHAT_AREA_TOP+y,line,color);
+    }
     y += CHAT_LINE_HEIGHT;
   }
   if (chatSpriteReady && (!reuse || dirtyBottom>dirtyTop)) {
@@ -6710,12 +6843,16 @@ static void drawChatWindowAtPixel(int32_t scrollPixels) {
     if(reuse)tft.clearClipRect();
   }
   cachedPixel=chatStreamRendering && chatSpriteReady && rowCount<=10?scrollPixels:-1;
-  cachedTop=CHAT_AREA_TOP;cachedHeight=CHAT_AREA_HEIGHT;cachedStyle=int(cfg.uiStyle);cachedCount=rowCount;
+  cachedTop=CHAT_AREA_TOP;cachedHeight=CHAT_AREA_HEIGHT;cachedStyle=int(cfg.uiStyle);cachedCount=rowCount;cachedRevision=chatRenderRevision;
   tft.fillRect(0, CHAT_AREA_BOTTOM, CHAT_AREA_WIDTH, 2, TFT_BLACK);
   if (!chatSpriteReady) tft.clearClipRect();
 }
 
 static void drawChatWindow(bool rebuild) {
+  static int displayedLanguage=-1;
+  if(displayedLanguage!=int(cfg.uiLanguage)) {
+    displayedLanguage=int(cfg.uiLanguage);markChatLinesDirty();footerFrameKey="";footerStatusDetail="";
+  }
   const int expectedTop = PAGE1_HEADER_BOTTOM + 2 + (camPhoto.ready() && camPhoto.confirmed ? 52 : 0);
   if (CHAT_AREA_TOP != expectedTop) {
     applyChatLayout();
@@ -6823,6 +6960,7 @@ static void drawPage1Footer(const String& detail) {
                  : uiText("错误：", "Error: ", "Error: ") + (lastError.length() ? uiErrorText(lastError) : uiText("未知错误", "unknown", "unknown")) +
                        "\n" + uiText("C:关闭  长按A:语音", "C: dismiss  Hold A: speak", "C: dismiss  Hold A: speak");
     }
+    else if(chatHistoryUnsaved)text=uiText("回复未保存，仍在内存\nA:菜单 检查存储","Reply unsaved; kept in RAM\nA:menu check storage","Reply unsaved; kept in RAM\nA:menu check storage");
     else {
       const bool canScroll = chatLines.size() > CHAT_VISIBLE_LINES;
       const String voiceStatus = isAsrConfigured()
@@ -6936,6 +7074,8 @@ static void tickLlmWaitingAnimation(bool force) {
     return;
   }
   const uint32_t now = millis();
+  static uint32_t headerAt=0;
+  if(force || now-headerAt>=1000){headerAt=now;drawPage1TopLine();}
   if (!force && now - llmWaitingLastMs < 450) return;
   drawPage1Footer("");
   llmWaitingLastMs=millis();
@@ -7187,7 +7327,7 @@ static String menuItemCurrentValue(MenuItem item) {
     return promptProfiles.empty() ? uiText("未配置", "none", "none")
                                   : promptProfiles[promptMenuProfileIndex].name;
   }
-  if (item == MenuEnableThinking) return uiOnOff(cfg.enableThinking);
+  if (item == MenuEnableThinking) return camDeepSeekPolicy(cfg.llmModelId,cfg.llmApiUrl)?String(cfg.enableThinking?camThinkingEffort(cfg.deepseekThinkingLevel):"off"):uiOnOff(cfg.enableThinking);
   if (item == MenuThinkingDisplay) return cfg.showThinking ? uiText("显示", "SHOW", "SHOW") : uiText("隐藏", "HIDE", "HIDE");
   if (item == MenuAsrProvider) return asrProviderText(cfg.asrProvider) +
                                       (isAsrConfigured() ? uiText(" 就绪", " READY", " READY") : uiText(" 待配置", " SETUP", " SETUP"));
@@ -7559,6 +7699,7 @@ static void cancelLocalSettingEdit() {
   sleepMinutes = localSettingOriginalSleepMinutes;
   cfg.uiStyle = localSettingOriginalStyle;
   cfg.uiLanguage = localSettingOriginalLanguage;
+  markChatLinesDirty();footerFrameKey="";footerStatusDetail="";
   applyBrightness();
   localSettingEditActive = false;
   menuEditing = false;
@@ -7625,9 +7766,9 @@ static void drawPage2Body() {
     view.print(fitText(uiText("A:确认  B/C:取消", "A: confirm  B/C: cancel", "A: confirm  B/C: cancel"), 220));
   } else if (chatStorageNotice) {
     view.setTextColor(TFT_ORANGE,footerBg);
-    view.print(fitText(uiText("会话保存失败或TF卡不可用","Chat save failed / TF unavailable","Chat save failed / TF unavailable"),220));
+    view.print(fitText(uiText(chatSessionOnTf()?"TF会话未保存":"Flash会话未保存","Conversation not saved","Conversation not saved"),220));
     view.setCursor(10,218);
-    view.print(fitText(uiText("检查原TF卡和空间后重试","Check original TF card / space","Check original TF card / space"),220));
+    view.print(fitText(uiText(chatSessionOnTf()?"检查原TF卡和空间后重试":"检查Flash空间，串口可重试","Check storage / retry via serial","Check storage / retry via serial"),220));
   } else if (wifiConnectFailed && !menuEditing) {
     view.setTextColor(TFT_YELLOW, footerBg);
     view.print(fitText(uiText("Wi-Fi 连接失败：请选择网络", "Wi-Fi failed: pick a network", "Wi-Fi failed: pick a network"), 220));
@@ -7947,8 +8088,7 @@ static void setState(AppState state, const String& detail) {
 
 static String draftEditFooter() {
   const String altLang = cfg.asrEnglishMode ? "CN" : "EN";
-  return uiText(camPhoto.ready()?"图文草稿":"语音草稿",camPhoto.ready()?"Photo ":"Draft ",camPhoto.ready()?"Photo ":"Draft ")+String(pendingSegments.size())+
-      uiText(" A发送 C撤回\n长A追加 长B:"," A:send C:undo\nHold A:add Hold B:"," A:send C:undo\nHold A:add Hold B:")+altLang;
+  return uiText("A发送 C删字 双C清空\n长A追加 长B:", "A:send C:erase 2C:clear\nHold A:add Hold B:", "A:send C:erase 2C:clear\nHold A:add Hold B:")+altLang;
 }
 
 static void showVoiceRetryHint(const String& detail) {
@@ -8232,6 +8372,8 @@ static size_t markdownStablePrefixLength(const String& text, size_t desired,
         i=end;atLineStart=false;continue;
       }
       size_t commandEnd=i+1;while(commandEnd<text.length() && asciiAlpha(text[commandEnd]))++commandEnd;
+      const String command=text.substring(i+1,commandEnd);
+      if(command=="frac" || command=="dfrac" || command=="tfrac"){safe=i;break;}
       if(commandEnd==text.length() || text[commandEnd]=='{' || text[commandEnd]=='[') {safe=i;break;}
     }
     if (ch == RICH_CODE_TOGGLE) {
@@ -8239,7 +8381,7 @@ static size_t markdownStablePrefixLength(const String& text, size_t desired,
       ++i;
       continue;
     }
-    if (ch == RICH_BOLD_TOGGLE || ch == RICH_HEADING_TOGGLE) {
+    if (ch == RICH_BOLD_TOGGLE || ch == RICH_HEADING_TOGGLE || camRichDecoration(ch)) {
       ++i;
       continue;
     }
@@ -8745,7 +8887,7 @@ static bool performTavilySearch(const String& query, String& digest, const Strin
       if (!responseOk) {lastError=uiText("搜索响应过大或超时","Search response too large or timed out","Search response too large or timed out");return false;}
       if (code >= 200 && code < 300) {
         if (cfg.searchProvider?camBuildDeepseekDigest(resp,effectiveQuery,digest):buildTavilyDigestFromJson(resp, effectiveQuery, digest)) {
-          if(cfg.searchProvider && cfg.searchMode != SearchMode::Auto)camMaybeFetchSearchPage(resp,digest);
+          if(cfg.searchProvider)camMaybeFetchSearchPage(resp,digest);
           camLastSearchSources=digest;
           Serial.printf("[SEARCH] provider=%u digest_bytes=%u\n",cfg.searchProvider,unsigned(digest.length()));
           return true;
@@ -8769,28 +8911,29 @@ static bool performTavilySearch(const String& query, String& digest, const Strin
 
 static bool postLlmJson(const String& body, String& resp, const char* tag = "LLM",
                         uint32_t timeoutMs = LLM_TIMEOUT_MS) {
+  resp="";
   WiFiClientSecure client;
-  camConfigureTls(client);
+  if(!camConfigureTls(client)){lastError="LLM TLS clock/trust unavailable";return false;}
   // Keep the socket read timeout well below the request budget.  On a weak
   // Wi-Fi link a TLS record can stall for many seconds; without this the read
   // blocks past the caller's retry window and the whole attempt is wasted.
   client.setTimeout(LLM_HTTP_SOCKET_TIMEOUT_S);
   HTTPClient http;
-  http.setTimeout(timeoutMs);
+  http.setTimeout(timeoutMs);http.setConnectTimeout(min<uint32_t>(timeoutMs,12000));
   if (!http.begin(client, cfg.llmApiUrl)) {
     lastError = String(tag) + " http.begin failed";
     return false;
   }
   http.addHeader("Content-Type", "application/json");
   http.addHeader("Authorization", String("Bearer ") + cfg.llmApiKey);
-  // Reusing the connection avoids a fresh TLS handshake per request, which is
-  // the most failure-prone step on an unreliable link.
-  http.addHeader("Connection", "keep-alive");
+  // This client is local to one request; keep-alive cannot reuse it across calls.
+  http.addHeader("Connection", "close");
   Serial.printf("[%s] request bytes=%u\n", tag, unsigned(body.length()));
   int code = camRunHttpWithUi([&](){return http.POST(body);},true);
-  camRunHttpWithUi([&](){resp=http.getString();return int(resp.length());},true);
+  if(code>0)camRunHttpWithUi([&](){resp=http.getString();return int(resp.length());},true);
   if (code < 0) {
-    Serial.printf("[%s] error: %s\n", tag, http.errorToString(code).c_str());
+    char tlsError[128]={};const int tlsCode=client.lastError(tlsError,sizeof(tlsError));
+    Serial.printf("[%s] error: %s TLS=%d %s internal=%u largest=%u wifi=%d\n",tag,http.errorToString(code).c_str(),tlsCode,tlsError,unsigned(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)),unsigned(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL)),int(WiFi.status()));
   }
   http.end();
   // Keep the bare "HTTP <code>" line: the serial acceptance harness matches it
@@ -8871,7 +9014,7 @@ static bool checkActiveLlmTransport() {
 }
 
 static String extractLlmContentFromJson(const String& resp) {
-  JsonDocument doc;
+  JsonDocument doc(&camJsonAllocator);
   DeserializationError err = deserializeJson(doc, resp);
   if (err) {
     lastError = String("LLM JSON parse failed: ") + err.c_str();
@@ -9297,10 +9440,14 @@ static bool camSelectSearchEvidence(const String& question, const String& raw,
 
 static void camTickBusyUi() {
   if(camWebRunning)camWebCancelled();else camPollVisionCancel();
-  if(uiPage!=UiPage::Page1 || screenSleeping || cfg.clockMode || appState!=AppState::Thinking)return;
+  if(uiPage!=UiPage::Page1 || screenSleeping || cfg.clockMode || (appState!=AppState::Thinking && appState!=AppState::Recognizing && appState!=AppState::Listening))return;
   static uint32_t lastHeader=0,lastWait=0;
   const uint32_t now=millis();
   if(!lastHeader || now-lastHeader>=1000) {lastHeader=now;drawPage1TopLine();++camBusyHeaderTicks;}
+  static uint32_t meterAt=0;
+  if(recording && usesIatV2() && (!meterAt || now-meterAt>=100)) {
+    meterAt=now;drawRecordingFooter(bufferedMic.liveRms.load(std::memory_order_acquire));
+  }
   if(camLlmNetworkWaiting && (!lastWait || now-lastWait>=200)) {
     lastWait=now;
     drawPage1Footer(uiText("等待模型回复 ","Waiting for reply ","Waiting for reply ")+String((now-camLlmWaitingSince)/1000)+"s");
@@ -9318,7 +9465,7 @@ static void camShowLlmPhase(unsigned phase,uint32_t elapsedMs) {
 
 
 static bool parseLlmFullJson(const String& resp, String& answer) {
-  JsonDocument doc;
+  JsonDocument doc(&camJsonAllocator);
   DeserializationError err = deserializeJson(doc, resp);
   if (err) {
     lastError = String("LLM JSON parse failed: ") + err.c_str();
@@ -9355,7 +9502,7 @@ static bool parseLlmFullJson(const String& resp, String& answer) {
 }
 
 static String camWebMessageContext(const ChatMsg& message,bool includeEvidence) {
-  String text=stripDisplayMarkers(message.content);
+  String text=stripDisplayMarkers(camHistoryDisplayText(message.content.c_str(),message.content.length(),false,""));
   if(includeEvidence && message.webEvidence.length()) {
     text+="\n<prior_web_research_untrusted>\n";
     text+=String(message.webEvidence);
@@ -9548,19 +9695,8 @@ static String buildLlmRequestBodyBudget(size_t skipMessageIndex, bool stream,
     }
     if (!selected && (chatHistory[i].content.length() || i == currentUserIndex)) ++skipped;
   }
-  req["temperature"] = 0.3;
   req["stream"] = stream;
-  // Ask the gateway not to emit reasoning when the user has thinking off.
-  //
-  // Measured: one long answer put ~935 KB of SSE on the wire while the visible
-  // text was only ~7 KB -- the rest was reasoning deltas the filter discards.
-  // Draining a megabyte to keep a few kilobytes is what pushed the stream past
-  // its budget and cut the reply in half.  When thinking IS enabled the reasoning
-  // is wanted, so the field is only sent in the off case.
-  if (!cfg.enableThinking) {
-    req["thinking"] = serialized("{\"type\":\"disabled\"}");
-    req["reasoning_effort"] = "none";
-  }
+  camApplyLlmPolicy(req,cfg.llmModelId,cfg.llmApiUrl,cfg.enableThinking,false,cfg.deepseekThinkingLevel);
 
   String body;
   serializeJson(req, body);
@@ -9598,13 +9734,13 @@ static String buildLlmRequestBody(size_t skipMessageIndex, bool stream,
   return "";
 }
 
-static void camPrintAssistantReply(const String& answer,bool complete=true) {
+static void camPrintAssistantReply(const PsramString& answer,bool complete=true) {
   if(!camSerialReplies)return;
   Serial.printf("\n[LLM-REPLY-BEGIN] complete=%d\n",complete);
   bool thinking=false;uint8_t chunk[240];size_t used=0;
-  for(size_t i=0;i<answer.length();++i){const char ch=answer[i];
+  for(size_t i=0;i<answer.length();++i){const char ch=answer.c_str()[i];
     if(ch==RICH_LITERAL_ESCAPE && i+1<answer.length()){
-      const char literal=answer[++i];if(!thinking)chunk[used++]=literal;
+      const char literal=answer.c_str()[++i];if(!thinking)chunk[used++]=literal;
     } else if(ch==RICH_THINKING_TOGGLE){thinking=!thinking;continue;}
     else if(ch==RICH_BOLD_TOGGLE || ch==RICH_HEADING_TOGGLE || ch==RICH_CODE_TOGGLE)continue;
     else if(!thinking)chunk[used++]=uint8_t(ch);
@@ -9751,15 +9887,20 @@ class LlmSseSink : public Stream {
           uiPage==UiPage::Page1 && !screenSleeping && !camStreamRevealSkipRequested) {
       if(camPollVisionCancel())break;updateUi(false);delay(1);yield();
     }
+    answerView_="";
     if(foldPrefixBytes_ && reasoningArchive_.length()) {
-      String restored;const size_t expected=1+reasoningArchive_.length()+answer_.length()-foldPrefixBytes_;
-      if(restored.reserve(expected+160)) {
-        restored+=RICH_THINKING_TOGGLE;restored+=reasoningArchive_.c_str();
-        if(reasoningArchiveFull_)restored+=uiText("\n[部分思考超出设备归档上限]\n","\n[Some reasoning exceeded device archive limit]\n","\n[Some reasoning exceeded device archive limit]\n");
-        restored+=answer_.substring(foldPrefixBytes_);answer_=std::move(restored);
+      constexpr size_t limit=131072;const char toggle=RICH_THINKING_TOGGLE;
+      bool ok=answerView_.append(&toggle,1,limit) && answerView_.append(reasoningArchive_.c_str(),reasoningArchive_.length(),limit);
+      if(reasoningArchiveFull_) {
+        const String warning=uiText("\n[部分思考超出设备归档上限]\n","\n[Some reasoning exceeded device archive limit]\n","\n[Some reasoning exceeded device archive limit]\n");
+        ok=ok && answerView_.append(warning.c_str(),warning.length(),limit);
       }
-    }
+      ok=ok && answerView_.append(answer_.c_str()+foldPrefixBytes_,answer_.length()-foldPrefixBytes_,limit);
+      if(!ok){parseFailed_=memoryFailed_=true;lastError="PSRAM reasoning restoration failed";}
+    } else answerView_=answer_;
+    answerFinalized_=true;
     visibleLen_ = answer_.length();
+    chatStreamRendering=false;chatScrollPixels=chatScrollTargetPixels;
     redraw(true);
     Serial.printf("[LLM-REVEAL] frames=%u max_step_bytes=%u skipped=%d\n",unsigned(revealFrames_),unsigned(maxRevealStep_),camStreamRevealSkipRequested);
     Serial.printf("[LLM-TIMING] total_ms=%u first_think_ms=%ld first_content_ms=%ld reasoning_bytes=%u ui_frames=%u max_ui_ms=%u live_max_ui_ms=%u final_ui_ms=%u\n",
@@ -9775,10 +9916,11 @@ class LlmSseSink : public Stream {
   bool sawSse() const { return sawSse_; }
   bool done() const { return done_; }
   bool failed() const { return parseFailed_; }
+  bool memoryFailed()const{return memoryFailed_;}
   bool outputLimited() const { return outputLimited_; }
   bool truncated() const { return outputLimited_; }
-  String answer() const { return answer_; }
-  String fallback() const { return fallback_; }
+  const PsramString& answer() const {if(!answerFinalized_)answerView_=answer_;return answerView_;}
+  const String& fallback() const { return fallback_; }
 
  private:
   void beginThinkingClock() {
@@ -9797,7 +9939,7 @@ class LlmSseSink : public Stream {
     while(cut<answer_.length() && (uint8_t(answer_[cut])&0xC0)==0x80)++cut;
     const size_t begin=foldPrefixBytes_?foldPrefixBytes_:1;
     if(cut>begin && !reasoningArchive_.append(answer_.c_str()+begin,cut-begin))reasoningArchiveFull_=true;
-    const String prefix=String(RICH_THINKING_TOGGLE)+uiText("[流式显示最新思考，结束后可回看]\n","[Live reasoning tail; earlier text restored on completion]\n","[Live reasoning tail; earlier text restored on completion]\n");
+    const String prefix=String(RICH_THINKING_TOGGLE)+uiText("[流式显示最新思考，结束后折叠长段]\n","[Live reasoning tail; long archive folded on completion]\n","[Live reasoning tail; long archive folded on completion]\n");
     answer_=prefix+answer_.substring(cut);foldPrefixBytes_=prefix.length();
     visibleLen_=answer_.length(); // Folding moves the live window; never retype old reasoning.
     layoutVisibleLen_=size_t(-1);
@@ -9977,7 +10119,7 @@ class LlmSseSink : public Stream {
     }
     // Only the final redraw copies the whole answer into PSRAM/history.
     // During transport, normalization and wrapping touch <=768 bytes.
-    if (force) updateChatMessageContent(assistantIndex_, answer_, true);
+    if(force && !memoryFailed_){if(answerFinalized_){if(!camStorePsramMessage(assistantIndex_,answerView_,true))parseFailed_=memoryFailed_=true;}else updateChatMessageContent(assistantIndex_,answer_,true);}
     if (incrementalReady_ && !force && layoutVisibleLen_!=visibleLen_) {
       rebuildIncrementalLines();layoutVisibleLen_=visibleLen_;
     }
@@ -9997,6 +10139,7 @@ class LlmSseSink : public Stream {
 
   size_t assistantIndex_;
   PsramString reasoningArchive_;
+  mutable PsramString answerView_;bool answerFinalized_=false;
   size_t foldPrefixBytes_=0;
   bool reasoningArchiveFull_=false;
   String line_;
@@ -10006,7 +10149,7 @@ class LlmSseSink : public Stream {
   JsonDocument sseFilter_{&camJsonAllocator};
   bool sawSse_ = false;
   bool done_ = false;
-  bool parseFailed_ = false;
+  bool parseFailed_ = false;bool memoryFailed_=false;
   bool outputLimited_ = false;
   bool lineOverflow_ = false;
   bool insideThinkTag_ = false;
@@ -10072,11 +10215,11 @@ static void runStreamBench() {
       const size_t end = advanceUtf8VisibleLen(final, at, 20);
       doc.clear(); doc["choices"][0]["delta"]["content"] = final.substring(at, end);
       json = ""; serializeJson(doc, json);
-      record = "data: " + json + "\n\n"; 
+      record = "data: " + json + "\n\n";
       sink.write(reinterpret_cast<const uint8_t*>(record.c_str()), record.length()); at = end;
     }
     doc.clear(); doc["choices"][0]["finish_reason"] = "stop";
-    json = ""; serializeJson(doc, json); record = "data: " + json + "\n\n"; 
+    json = ""; serializeJson(doc, json); record = "data: " + json + "\n\n";
     sink.write(reinterpret_cast<const uint8_t*>(record.c_str()), record.length());
     sink.finish();
     pass = sink.done() && !sink.failed() && !sink.outputLimited() && sink.answer().endsWith(final);
@@ -10305,7 +10448,7 @@ static bool askLLMStreamOnce(size_t assistantIndex, const String& searchContext,
   // no reason to special-case streaming here.
 
   WiFiClientSecure client;
-  camConfigureTls(client);
+  if(!camConfigureTls(client)){lastError="LLM TLS clock/trust unavailable";return false;}
   // HTTPClient reuses this client's socket timeout for every read.  Leaving it
   // at the 30 s request timeout lets TLS record reads block far longer than
   // our idle budget, so a slow chunk looks like a dead socket and truncates
@@ -10314,7 +10457,7 @@ static bool askLLMStreamOnce(size_t assistantIndex, const String& searchContext,
   client.setTimeout(LLM_STREAM_IDLE_TIMEOUT_MS / 1000);
   HTTPClient http;
   const uint32_t timeoutMs = searchContext.length() ? LLM_SEARCH_HTTP_TIMEOUT_MS : LLM_TIMEOUT_MS;
-  http.setTimeout(timeoutMs);
+  http.setTimeout(timeoutMs);http.setConnectTimeout(min<uint32_t>(timeoutMs,12000));
   if (!http.begin(client, cfg.llmApiUrl)) {
     retryableFailure = true;
     lastError = "LLM http.begin failed";
@@ -10332,14 +10475,16 @@ static bool askLLMStreamOnce(size_t assistantIndex, const String& searchContext,
                 cfg.llmModelId.c_str(), unsigned(body.length()),
                 searchContext.length() ? "yes" : "no");
 
+  if(!body.length()){lastError="LLM request allocation failed";return false;}
   const uint32_t requestStartedAt=millis();
   int code = camRunHttpWithUi([&](){return http.sendRequest("POST", body);},true);
   if (code < 0) {
-    Serial.printf("[LLM] stream error: %s\n", http.errorToString(code).c_str());
+    char tlsError[128]={};const int tlsCode=client.lastError(tlsError,sizeof(tlsError));
+    Serial.printf("[LLM] stream error: %s TLS=%d %s internal=%u largest=%u wifi=%d\n",http.errorToString(code).c_str(),tlsCode,tlsError,unsigned(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)),unsigned(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL)),int(WiFi.status()));
   }
   Serial.printf("[LLM] HTTP %d\n", code);
   if (code < 200 || code >= 300) {
-    String resp = http.getString();
+    String resp = code>0?http.getString():String();
     if (resp.length()) Serial.println(truncateUtf8ToBytes(resp, 512));
     http.end();
     if (searchContext.length() && code < 0) {
@@ -10375,6 +10520,11 @@ static bool askLLMStreamOnce(size_t assistantIndex, const String& searchContext,
                 unsigned(sink.answer().length()),
                 unsigned(sink.fallback().length()));
 
+  if(sink.memoryFailed()) {
+    retryableFailure=false;
+    lastError=uiText("回复归档内存不足，已停止重试","Reply archive memory unavailable; retries stopped","Reply archive memory unavailable; retries stopped");
+    return false;
+  }
   if (sink.outputLimited()) {
     lastError = "模型输出达到上限，回复未完成，请缩小问题范围";
     retryableFailure = false;
@@ -10424,7 +10574,7 @@ static bool askLLMStreamOnce(size_t assistantIndex, const String& searchContext,
       lastError = "LLM stream has no text";
       return false;
     }
-    updateChatMessageContent(assistantIndex, sink.answer());
+    if(!camStorePsramMessage(assistantIndex,sink.answer()))return false;
     lastLlmResponseWasSse = true;
     Serial.printf("[LLM] stream answer %u bytes\n", unsigned(sink.answer().length()));
     return true;
@@ -10486,7 +10636,7 @@ struct CamTextArchiveAttempt {
   String question, provider, model;
   bool enabled;
   bool complete = false;
-  String answer;
+  PsramString answer;
   CamTextArchiveAttempt(const String& q) : session(cfg.currentSession), question(q),
       provider(cfg.llmProviderName), model(cfg.llmModelId), enabled(!llmTestIsolation && !camValidationMode) {}
   ~CamTextArchiveAttempt() {
@@ -10533,14 +10683,10 @@ static bool askAndStoreChat(String question, bool forceSearch) {
   // `llmtest` is a transport/rendering probe.  Let it exercise only the
   // isolated-history streaming request, not the user-facing search gate whose
   // protocol deliberately rejects the test's six-line response payload.
-  bool agentSearch = (cfg.searchMode == SearchMode::Agent || cfg.searchMode == SearchMode::Auto) && !llmTestIsolation;
-  // ON applies to voice/UI questions as well as the serial `chat` command;
-  // AGENT is handled below through the isolated SEARCH/ANSWER gate.
-  // Keep the transport/rendering probe deterministic.  It must never invoke
-  // Tavily, even when the user's persisted search mode is ON or the test
-  // prompt happens to contain a freshness keyword.
-  bool useSearch = !llmTestIsolation &&
-                   (forceSearch || prefixSearch || cfg.searchMode == SearchMode::On);
+  // AUTO makes the decision, then runs the former AGENT research pipeline.
+  // OFF disables question-triggered networking, including retries/prefixes.
+  const bool agentSearch=camSearchChatEnabled(cfg.searchMode,llmTestIsolation);
+  const bool useSearch=agentSearch && (forceSearch || prefixSearch);
   bool actualUseSearch = useSearch;
   if (!connectWifi()) {
     lastFailedQuestion = question;
@@ -10575,8 +10721,6 @@ static bool askAndStoreChat(String question, bool forceSearch) {
 
   String searchContext;
   bool searchFallback = false;
-  String directAnswerPayload;
-  bool directAnswerReady = false;
   if(agentSearch) {
     const bool ok=camRunWebResearch(question,assistantIndex,forceSearch || prefixSearch,searchContext,actualUseSearch);
     if(assistantIndex>0 && chatHistory[assistantIndex-1].role=="user") {
@@ -10600,48 +10744,9 @@ static bool askAndStoreChat(String question, bool forceSearch) {
       Serial.printf("[WEB-MEMORY] evidence_bytes=%u stored_with_user_turn=1\n",unsigned(searchContext.length()));
     }
     saveChatHistory();
-  } else if (useSearch || agentSearch) {
-    String searchQuery = normalizeSearchQuery(question);
-    if (!searchQuery.length()) searchQuery = question;
-    bool shouldSearch = true;
-    if (agentSearch && !forceSearch && !prefixSearch) {
-      setState(AppState::Thinking, uiText("正在判断是否搜索...", "Deciding search...", "Deciding search..."));
-      shouldSearch = askLlmSearchDecision(question, false, searchQuery,
-                                           directAnswerPayload);
-      // The gate has a small token budget and no history. Its output is never
-      // a user answer, even if an older gateway still emits ANSWER:.
-      directAnswerPayload = "";
-
-    }
-    actualUseSearch = shouldSearch;
-    if (shouldSearch) setState(AppState::Thinking, uiText("正在联网搜索...", "Searching the web...", "Searching the web..."));
-    if (shouldSearch && !performTavilySearch(searchQuery, searchContext, question)) {
-      String searchFailureLog = "[Tavily] failed; using direct LLM fallback";
-      if (lastError.length()) {
-        searchFailureLog += ": ";
-        searchFailureLog += lastError;
-      }
-      Serial.println(searchFailureLog);
-      searchContext = "Search failed. No live sources were retrieved. Tell the user information may be outdated; do not invent sources or claim live verification.";
-      actualUseSearch = false;
-      searchFallback = true;
-      lastError = "";
-    }
-    if (!shouldSearch) searchContext = "";
   }
 
-  bool answerReady = false;
-  if (directAnswerReady) {
-    // The gate's ANSWER payload has already been filtered and bounded above;
-    // persist it as the assistant message without a second LLM request.
-    setState(AppState::Thinking, uiText("直接回答...", "Direct answer...", "Direct answer..."));
-    updateChatMessageContent(assistantIndex, directAnswerPayload);
-    lastLlmResponseWasSse = false;
-    Serial.printf("[LLM] direct gate answer bytes=%u\n",
-                  unsigned(directAnswerPayload.length()));
-    answerReady = true;
-  }
-  if (!answerReady) {
+  {
     setState(AppState::Thinking,
              (!searchFallback && searchContext.length())
                  ? uiText("带搜索结果提问...", "Asking LLM with search...", "Asking LLM with search...")
@@ -10649,8 +10754,8 @@ static bool askAndStoreChat(String question, bool forceSearch) {
                         ? uiText("暂无可用证据，继续回答", "No usable evidence; answering", "No usable evidence; answering")
                         : uiText("正在等待 AI...", "Waiting for AI...", "Waiting for AI...")));
   }
-  if (!answerReady && !askLLMStream(assistantIndex, searchContext)) {
-    if (assistantIndex < chatHistory.size()) tfArchive.answer = String(chatHistory[assistantIndex].content);
+  if (!askLLMStream(assistantIndex, searchContext)) {
+    if (assistantIndex < chatHistory.size()) tfArchive.answer = chatHistory[assistantIndex].content;
     const size_t partialLen =
         (assistantIndex < chatHistory.size() &&
          chatHistory[assistantIndex].role == "assistant")
@@ -10681,13 +10786,13 @@ static bool askAndStoreChat(String question, bool forceSearch) {
   saveChatHistory();
   lastFailedQuestion = "";
   lastFailedUseSearch = false;
-  String answer = assistantIndex < chatHistory.size()
-                      ? String(chatHistory[assistantIndex].content) : String("");
+  static const PsramString emptyAnswer;
+  const PsramString& answer=assistantIndex<chatHistory.size()?chatHistory[assistantIndex].content:emptyAnswer;
   tfArchive.answer = answer;
   tfArchive.complete = true;
   camPrintAssistantReply(answer);
   camVoiceOnlyQuestion=false;camQuestionReadyForVoice=false;
-  paginate(answer);
+  // The home chat renderer owns layout; legacy pages duplicated the whole answer.
   chatScroll = SIZE_MAX;
   showPage();
   if (actualUseSearch && uiPage == UiPage::Page1 && !screenSleeping) {
@@ -10701,6 +10806,7 @@ static bool askAndStoreChat(String question) {
 }
 
 static void startRecording() {
+  draftEraseGesture.reset();
   if (camPhotoOnly && !camQuestionRequiresPhoto && !camQuestionReadyForVoice && !composingQuestion) { camOpenPreview(); return; }
   if (!asrAppendMode && lastFailedQuestion.length()) {
     if (!camQuestionPhotoCount()) camReleasePhoto();
@@ -10726,14 +10832,21 @@ static void startRecording() {
     }
     recording=true;stoppingRecording=false;recordStartedAt=millis();
     camIatLiveSentSamples=0;
-    if(cfg.asrProvider==AsrProvider::XfyunV2 && (!connectWifi() || !startAsrSession())) {
+    transcript=pendingQuestion;
+    setState(AppState::Listening,uiText("正在连接语音，已开始录音","Connecting ASR; already recording","Connecting ASR; already recording"));
+    const uint32_t connectStarted=millis();
+    const bool customLive=cfg.asrProvider==AsrProvider::CustomIat;
+    const bool connected=connectWifi() && camRunHttpWithUi([](){return startAsrSession()?1:0;})==1;
+    asrWsConnectMs=millis()-connectStarted;
+    if(!connected) {
       bufferedMic.cancel();bufferedMic.release();recording=false;
       setState(AppState::Error,lastError);return;
     }
     transientSearchResult="";lastFailedQuestion="";lastFailedUseSearch=false;
     transcript=pendingQuestion;
     setState(AppState::Listening,uiText("请说话，松开 ","Speak; release ","Speak; release ")+String(recordingReleaseKey)+uiText(" 结束"," to finish"," to finish"));
-    Serial.printf("[MIC-CAPTURE] started shift=%d capacity_bytes=%u limit_ms=%lu network_deferred=1\n",MIC_SAMPLE_SHIFT,unsigned(capacity*2),(unsigned long)limitMs);
+    Serial.printf("[MIC-CAPTURE] started shift=%d capacity_bytes=%u limit_ms=%lu network_deferred=0 streaming=1 body_limit_ms=%lu\n",MIC_SAMPLE_SHIFT,unsigned(capacity*2),(unsigned long)limitMs,
+        (unsigned long)camAsrLiveBodyLimitMs(customLive,MAX_RECORD_SECONDS,ASR_TAIL_CAPTURE_MS));
     return;
   }
   if (transientSearchResult.length()) {
@@ -10827,35 +10940,49 @@ static void stopRecordingAndAnswer() {
   stoppingRecording = true;
   recording = false;
   recordingReleaseKey = 'A';
-  setState(AppState::Recognizing, "正在结束录音...");
+  setState(AppState::Recognizing, uiText("正在结束录音...","Finishing recording...","Finishing recording..."));
   if(usesIatV2()) {
-    bufferedMic.stopAfter(uint32_t(MIC_SAMPLE_RATE)*ASR_TAIL_CAPTURE_MS/1000);
+    const bool customLive=cfg.asrProvider==AsrProvider::CustomIat;
+    const uint32_t tailSamples=uint32_t(MIC_SAMPLE_RATE)*ASR_TAIL_CAPTURE_MS/1000;
+    if(customLive)bufferedMic.finishAt(min<uint32_t>(bufferedMic.samples.load(std::memory_order_acquire)+tailSamples,
+        uint32_t(MIC_SAMPLE_RATE)*CUSTOM_IAT_MAX_RECORD_SECONDS));
+    else bufferedMic.stopAfter(tailSamples);
     const uint32_t tailStarted=millis();
     while(!bufferedMic.wait(20) && millis()-tailStarted<ASR_TAIL_CAPTURE_MS+1000) tickLlmWaitingAnimation(false);
     if(!bufferedMic.good()) {
       bufferedMic.cancel();
       lastError="Microphone capture incomplete (overflow/read error)";
       printCustomAsrStats("mic",false,recordStartedAt);
-    } else if(cfg.asrProvider==AsrProvider::XfyunV2) {
+      closeAsrSocket();
+    } else {
+      const uint32_t flushStarted=millis();
+      asrInputPcmBytes=size_t(bufferedMic.stats.samples)*2;
+      if(customLive && asrInputPcmBytes>size_t(MIC_SAMPLE_RATE)*2*CUSTOM_IAT_MAX_RECORD_SECONDS)
+        lastError="ASR total recording exceeds gateway limit";
       while(camIatLiveSentSamples<bufferedMic.stats.samples && !lastError.length()) {
-        const size_t count=min<size_t>(640,bufferedMic.stats.samples-camIatLiveSentSamples);
+        const size_t count=camIatPublishedBatch(bufferedMic.stats.samples,camIatLiveSentSamples,customLive,true);
         if(!sendAsrAudio(reinterpret_cast<uint8_t*>(bufferedMic.data+camIatLiveSentSamples),count*2,false)) {
           if(!lastError.length())lastError="ASR live audio send failed";break;
         }
-        camIatLiveSentSamples+=count;yield();
+        camIatLiveSentSamples+=count;asrSentPcmBytes=camIatLiveSentSamples*2;yield();
       }
-      if(!lastError.length())finishAsrSession();else closeAsrSocket();
-    } else {
-      setState(AppState::Recognizing,"正在上传完整录音...");
-      const String savedIatLanguage = iatLanguage();
-      const bool savedEnglishMode = cfg.asrEnglishMode;
-      if (cfg.asrProvider == AsrProvider::CustomIat) cfg.customIatLanguage = camBufferedIatLanguage;
-      else cfg.xfyun2Language = camBufferedIatLanguage;
-      cfg.asrEnglishMode = camBufferedEnglishMode;
-      uploadCustomPcm(bufferedMic.data,size_t(bufferedMic.stats.samples)*2,"mic",recordStartedAt);
-      cfg.asrEnglishMode = savedEnglishMode;
-      if (cfg.asrProvider == AsrProvider::CustomIat) cfg.customIatLanguage = savedIatLanguage;
-      else cfg.xfyun2Language = savedIatLanguage;
+      asrUploadMs+=millis()-flushStarted;
+      const uint32_t finalStarted=millis();
+      if(!lastError.length()) {
+        setState(AppState::Recognizing,uiText("正在确认最终识别结果...","Confirming final transcript...","Confirming final transcript..."));
+        finishAsrSession();
+        if(customLive && (!asrCompleted || asrHadError || !xfyunIat.finalReceived) && !lastError.length())
+          lastError="ASR final result missing";
+      } else closeAsrSocket();
+      asrFinalWaitMs=millis()-finalStarted;
+      if(customLive) {
+        uint8_t digest[32];
+        if(mbedtls_md(mbedtls_md_info_from_type(MBEDTLS_MD_SHA256),reinterpret_cast<const uint8_t*>(bufferedMic.data),asrInputPcmBytes,digest)==0) {
+          Serial.print("[ASR-PCM] sha256=");for(uint8_t value:digest)Serial.printf("%02x",value);
+          Serial.printf(" bytes=%u streaming=1\n",unsigned(asrInputPcmBytes));
+        }
+        printCustomAsrStats("mic",!lastError.length(),recordStartedAt);
+      }
     }
     bufferedMic.release();
   } else sendTailAudio(ASR_TAIL_CAPTURE_MS);
@@ -11344,14 +11471,21 @@ static void camTestChat(const String& question,unsigned visionRounds=0,bool scre
 }
 
 static void handleCommand(String line) {
+  if(line=="scroll status") {
+    Serial.printf("[SCROLL] current=%ld target=%ld lead=%ld hold=%d frames=%lu max_draw_ms=%lu max_frame_ms=%lu pending_keys=%u\n",(long)chatScrollPixels,(long)chatScrollTargetPixels,(long)(chatScrollTargetPixels-chatScrollPixels),chatScrollHoldDir,(unsigned long)chatScrollFrames,(unsigned long)chatScrollMaxDrawMs,(unsigned long)chatScrollMaxFrameMs,buttonEvents?unsigned(uxQueueMessagesWaiting(buttonEvents)):0);return;
+  }
+  if(line=="scroll bench"){camScrollBench();return;}
   if(line.startsWith("testchat64snap ")){String text;if(base64DecodeString(line.substring(15),text))camTestChat(text,0,true);return;}
-  if(line=="httpuibench") {
+  if(line=="httpuibench" || line=="asruibench") {
     if(!camAcquireModelTransport()){Serial.println("[HTTP-UI-BENCH] busy");return;}
-    const AppState savedState=appState;appState=AppState::Thinking;
+    const AppState savedState=appState;const String savedDetail=footerStatusDetail;
+    const bool asrBench=line=="asruibench";
+    appState=asrBench?AppState::Recognizing:AppState::Thinking;
+    if(asrBench)footerStatusDetail=uiText("正在上传完整录音...","Uploading recording...","Uploading recording...");
     const uint32_t before=camBusyHeaderTicks,started=millis();
     int result=camRunHttpWithUi([](){delay(3500);return 200;},true);
-    Serial.printf("[HTTP-UI-BENCH] %s elapsed_ms=%lu header_ticks=%lu no_network=1\n",result==200 && camBusyHeaderTicks-before>=3?"PASS":"FAIL",(unsigned long)(millis()-started),(unsigned long)(camBusyHeaderTicks-before));
-    appState=savedState;drawPage1();return;
+    Serial.printf("[%s] %s elapsed_ms=%lu header_ticks=%lu no_network=1\n",asrBench?"ASR-UI-BENCH":"HTTP-UI-BENCH",result==200 && camBusyHeaderTicks-before>=3?"PASS":"FAIL",(unsigned long)(millis()-started),(unsigned long)(camBusyHeaderTicks-before));
+    appState=savedState;footerStatusDetail=savedDetail;drawPage1();return;
   }
   if(line.startsWith("testchat64 ")){String text;if(base64DecodeString(line.substring(11),text))camTestChat(text);return;}
   if(line.startsWith("testvision64 ")) {
@@ -11362,7 +11496,7 @@ static void handleCommand(String line) {
   if(line=="sd backup"){camExportTfBackup();return;}
   if(line.startsWith("ui mathtest ")) {
     const String args=line.substring(12);const int space=args.indexOf(' ');
-    camMathScreenshot(args.toInt(),space>=0?args.substring(space+1).toInt():0);return;
+    camMathScreenshot(args.toInt(),space>=0?args.substring(space+1).toInt():0,args.endsWith(" en")?1:args.endsWith(" cn")?0:-1);return;
   }
   // The general parser and CAM parser each have large local stack frames.
   // Dispatch camera/TF commands before entering the general parser so FAT I/O
@@ -11472,6 +11606,13 @@ static void handleCommand(String line) {
 }
 
 static void handleGeneralCommand(String line) {
+  if(line=="chat status") {
+    Serial.printf("[CHAT-STATUS] session=%u store=%s messages=%u prefix=%u incomplete=%d unsaved=%d internal=%u largest=%u\n",unsigned(cfg.currentSession),chatSessionOnTf()?"TF":"Flash",unsigned(chatHistory.size()),unsigned(chatHistoryPrefixBytes),chatHistoryReadIncomplete,chatHistoryUnsaved,unsigned(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)),unsigned(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL)));
+    if(!chatSessionOnTf() && fsReady)Serial.printf("[CHAT-FLASH] total=%u used=%u free=%u\n",unsigned(SPIFFS.totalBytes()),unsigned(SPIFFS.usedBytes()),unsigned(SPIFFS.totalBytes()-SPIFFS.usedBytes()));
+    return;
+  }
+  if(line=="chat save"){const bool ok=saveChatHistory();Serial.printf("[CHAT-SAVE] ok=%d original_retained_on_failure=1\n",ok);if(uiPage==UiPage::Page1)drawPage1();return;}
+
   const bool camVoiceAskAlias = line == "voice ask 5";
   if (camVoiceAskAlias || line == "xfyun mic 5") {
     if (camVisionEnabled || pendingQuestion.length() || camPhoto.ready()) {
@@ -11913,7 +12054,7 @@ static void handleGeneralCommand(String line) {
     const uint32_t start=millis();
     asrWsConnectMs=asrUploadMs=asrFinalWaitMs=0;asrSentPcmBytes=0;lastError="";
     if(!bufferedMic.begin(MIC_I2S_PORT,micEvents,camMicCapacitySamples(MIC_SAMPLE_RATE,uint32_t(duration),0),MIC_SAMPLE_SHIFT)) { Serial.println("[MIC-CHECK] FAIL allocation/task");return; }
-    setState(AppState::Listening,"麦克风测试录音中");
+    setState(AppState::Listening,uiText("麦克风测试录音中","Microphone test recording","Microphone test recording"));
     bufferedMic.finishAt(uint32_t(duration)*MIC_SAMPLE_RATE/1000);
     uint32_t uiAt=0;
     while(!bufferedMic.wait(20) && millis()-start<uint32_t(duration)+2000) {
@@ -11921,7 +12062,7 @@ static void handleGeneralCommand(String line) {
     }
     bool ok=bufferedMic.good();
     if(!ok) bufferedMic.cancel();
-    if(ok && send) { setState(AppState::Recognizing,"正在上传完整录音...");ok=uploadCustomPcm(bufferedMic.data,size_t(bufferedMic.stats.samples)*2,"mic",start); }
+    if(ok && send) { setState(AppState::Recognizing,uiText("正在上传完整录音...","Uploading recording...","Uploading recording..."));ok=uploadCustomPcm(bufferedMic.data,size_t(bufferedMic.stats.samples)*2,"mic",start); }
     else printCustomAsrStats("mic",ok,start);
     Serial.printf("[MIC-CHECK] %s send=%u text=%s error=%s\n",ok?"PASS":"FAIL",unsigned(send),send?asrBestTranscript.c_str():"",lastError.c_str());
     const String camRecognized = ok && send ? asrBestTranscript : String("");
@@ -12201,11 +12342,11 @@ static void handleGeneralCommand(String line) {
       return;
     }
     if (value == "off") cfg.searchMode = SearchMode::Off;
-    else if (value == "on") cfg.searchMode = SearchMode::On;
+    else if (value == "on") cfg.searchMode = SearchMode::Auto; // legacy alias
     else if (value == "auto") cfg.searchMode = SearchMode::Auto;
-    else if (value == "agent") cfg.searchMode = SearchMode::Agent;
+    else if (value == "agent") cfg.searchMode = SearchMode::Auto; // legacy alias
     else {
-      Serial.println("Usage: tavily off|on|auto|agent|status");
+      Serial.println("Usage: searchmode off|auto|status");
       return;
     }
     saveRuntimeConfig();
@@ -12859,7 +13000,7 @@ static void handleGeneralCommand(String line) {
       Serial.println("Usage: chat <message>");
       return;
     }
-    if (askAndStoreChat(question, cfg.searchMode == SearchMode::On)) {
+    if (askAndStoreChat(question, false)) {
       Serial.println("Chat saved to history.");
     }
     return;
@@ -12954,6 +13095,14 @@ static void handleGeneralCommand(String line) {
     saveRuntimeConfig();
     Serial.println("LLM base URL saved as: " + cfg.llmApiUrl);
     return;
+  }
+  if(line.startsWith("thinkingeffort ")) {
+    String value=tailAfterToken(line,"thinkingeffort");value.toLowerCase();
+    if(value!="off" && value!="low" && value!="high" && value!="max"){Serial.println("Usage: thinkingeffort off|low|high|max");return;}
+    cfg.enableThinking=value!="off";
+    if(cfg.enableThinking)cfg.deepseekThinkingLevel=value=="low"?1:value=="max"?3:2;
+    else cfg.showThinking=false;
+    saveRuntimeConfig();refreshChatDisplayConfig();Serial.println("[THINKING-EFFORT] "+value);return;
   }
   if (line == "enablethinking" || line.startsWith("enablethinking ")) {
     String value = line == "enablethinking" ? "status" : tailAfterToken(line, "enablethinking");
@@ -13150,6 +13299,7 @@ static void jumpChatRound(int direction, bool repeat) {
   chatAutoScrollBottom=false;
   setChatScrollRow(chatRoundStarts[target]);
   drawChatWindowAtPixel(chatScrollPixels);
+  drawScrollbar();
   drawPage1Footer(uiText("第 ","Round ","Round ")+String(target+1)+"/"+String(chatRoundStarts.size())+
       uiText("  按住B/C加A","  Hold B/C + A","  Hold B/C + A"));
   Serial.printf("[CHAT-ROUND] round=%u count=%u row=%u direction=%d\n",unsigned(target+1),unsigned(chatRoundStarts.size()),unsigned(chatRoundStarts[target]),direction);
@@ -13163,6 +13313,9 @@ static void scrollChat(int delta, bool fast) {
   chatAutoScrollBottom = false;
   syncChatScrollRowsFromPixels();
   if (fast && delta != 0) {
+    const int direction=delta>0?1:-1;
+    chatScrollTargetPixels=camScrollReverseTarget(chatScrollPixels,chatScrollTargetPixels,direction);
+    if(chatScrollHoldDir!=direction){chatScrollHoldRemainder=chatScrollFrameRemainder=0;chatScrollHoldLastAt=millis();}
     chatScrollHoldDir = delta > 0 ? 1 : -1;
     if (chatScrollHoldLastAt == 0) chatScrollHoldLastAt = millis();
     drawPage1Footer(chatScrollStatusText(chatScrollTargetPixels));
@@ -13170,6 +13323,7 @@ static void scrollChat(int delta, bool fast) {
   }
   stopChatScrollHold();
   const int32_t maxPixels = maxChatScrollPixels();
+  chatScrollTargetPixels=camScrollReverseTarget(chatScrollPixels,chatScrollTargetPixels,delta);
   const int32_t oldTarget = chatScrollTargetPixels;
   chatScrollTargetPixels += int32_t(delta) * CHAT_LINE_HEIGHT;
   chatScrollTargetPixels = clampInt(chatScrollTargetPixels, 0, maxPixels);
@@ -13185,8 +13339,11 @@ static void scrollChat(int delta, bool fast) {
 }
 
 static void stopChatScrollHold() {
+  // A held key represents current motion, not a queue of future scrolling.
+  if(chatScrollHoldDir!=0)chatScrollTargetPixels=chatScrollPixels;
   chatScrollHoldDir = 0;
   chatScrollHoldLastAt = 0;
+  chatScrollHoldRemainder=chatScrollFrameRemainder=0;
 }
 
 static void updateChatScrollAnimation() {
@@ -13200,16 +13357,17 @@ static void updateChatScrollAnimation() {
     const uint32_t holdDt = min<uint32_t>(80, now - chatScrollHoldLastAt);
     chatScrollHoldLastAt = now;
     if (holdDt > 0) {
-      const int32_t step = max<int32_t>(
-          1, (int32_t(CHAT_SCROLL_HOLD_SPEED_PX_PER_SEC) * int32_t(holdDt)) / 1000);
+      const int32_t step=camScrollDistance(holdDt,CHAT_SCROLL_HOLD_SPEED_PX_PER_SEC,chatScrollHoldRemainder);
       chatScrollTargetPixels += int32_t(chatScrollHoldDir) * step;
+      chatScrollTargetPixels=clampInt(chatScrollTargetPixels,chatScrollPixels-CHAT_LINE_HEIGHT,chatScrollPixels+CHAT_LINE_HEIGHT);
       chatScrollTargetPixels =
           clampInt(chatScrollTargetPixels, 0, maxChatScrollPixels());
       const int32_t maxPixels = maxChatScrollPixels();
       if (chatScrollTargetPixels >= maxPixels) chatAutoScrollBottom = true;
       if ((chatScrollHoldDir < 0 && chatScrollTargetPixels == 0) ||
           (chatScrollHoldDir > 0 && chatScrollTargetPixels == maxPixels)) {
-        stopChatScrollHold();
+        // Finish the final visible row before stopping at an endpoint.
+        chatScrollHoldDir=0;chatScrollHoldLastAt=0;chatScrollHoldRemainder=0;
       }
     }
   }
@@ -13221,16 +13379,39 @@ static void updateChatScrollAnimation() {
   }
   const uint32_t dt = chatScrollLastFrameAt == 0
                           ? frameMs
-                          : min<uint32_t>(64, now - chatScrollLastFrameAt);
+                          : min<uint32_t>(80, now - chatScrollLastFrameAt);
+  chatScrollMaxFrameMs=max(chatScrollMaxFrameMs,dt);
   chatScrollLastFrameAt = now;
   const int32_t distance = chatScrollTargetPixels - chatScrollPixels;
-  int32_t step = max<int32_t>(
-      1, (int32_t(CHAT_SCROLL_TAP_SPEED_PX_PER_SEC) * int32_t(dt)) / 1000);
+  int32_t step=camScrollDistance(dt,CHAT_SCROLL_TAP_SPEED_PX_PER_SEC,chatScrollFrameRemainder);
   if (abs(distance) < step) step = abs(distance);
   chatScrollPixels += distance > 0 ? step : -step;
   syncChatScrollRowsFromPixels();
-  drawChatWindowAtPixel(chatScrollPixels);
+  const uint32_t drawStarted=millis();drawChatWindowAtPixel(chatScrollPixels);
   updateScrollbarThumb();
+  chatScrollMaxDrawMs=max(chatScrollMaxDrawMs,uint32_t(millis()-drawStarted));++chatScrollFrames;
+}
+
+static void camScrollBench() {
+  if(uiPage!=UiPage::Page1 || cfg.clockMode || recording || asrSessionActive || composingQuestion || appState==AppState::Thinking || maxChatScrollPixels()<440){Serial.println("[SCROLL-BENCH] idle long conversation required");return;}
+  const int32_t savedPixels=chatScrollPixels,savedTarget=chatScrollTargetPixels;
+  const bool savedAuto=chatAutoScrollBottom;
+  bool ok=true;
+  for(unsigned pause:{1U,45U,80U}) {
+    stopChatScrollHold();setChatScrollRow(size_t(maxChatScrollPixels()/44));
+    const int32_t beganAt=chatScrollPixels;chatScrollMaxDrawMs=chatScrollMaxFrameMs=chatScrollFrames=0;
+    scrollChat(1,true);const uint32_t began=millis();
+    while(millis()-began<1000){updateChatScrollAnimation();delay(pause);}
+    const uint32_t wall=millis()-began;const int32_t moved=chatScrollPixels-beganAt,lead=chatScrollTargetPixels-chatScrollPixels;
+    stopChatScrollHold();const int32_t afterRelease=chatScrollTargetPixels-chatScrollPixels;
+    chatScrollTargetPixels=chatScrollPixels+44;scrollChat(-1,false);
+    const bool reversed=chatScrollTargetPixels<chatScrollPixels;
+    ok=ok && moved>100 && abs(lead)<=CHAT_LINE_HEIGHT && afterRelease==0 && reversed;
+    Serial.printf("[SCROLL-BENCH-CASE] pause_ms=%u wall_ms=%lu moved_px=%ld lead_px=%ld release_lead=%ld reverse_ok=%d frames=%lu max_draw_ms=%lu max_frame_ms=%lu\n",pause,(unsigned long)wall,(long)moved,(long)lead,(long)afterRelease,reversed,(unsigned long)chatScrollFrames,(unsigned long)chatScrollMaxDrawMs,(unsigned long)chatScrollMaxFrameMs);
+  }
+  stopChatScrollHold();chatScrollPixels=savedPixels;chatScrollTargetPixels=savedTarget;chatAutoScrollBottom=savedAuto;
+  syncChatScrollRowsFromPixels();drawChatWindowAtPixel(chatScrollPixels);updateScrollbarThumb();drawPage1Footer(chatScrollStatusText(chatScrollPixels));
+  Serial.printf("[SCROLL-BENCH] %s original_view_restored=1 no_history_write=1\n",ok?"PASS":"FAIL");
 }
 
 static int clampInt(int value, int low, int high) {
@@ -13334,7 +13515,11 @@ static void changeMenuValue(int delta, bool fast) {
     int count = int(promptProfiles.size());
     promptMenuProfileIndex = uint8_t((int(promptMenuProfileIndex) + delta + count) % count);
   } else if (item == MenuEnableThinking) {
-    cfg.enableThinking = !cfg.enableThinking;
+    if(camDeepSeekPolicy(cfg.llmModelId,cfg.llmApiUrl)) {
+      int level=cfg.enableThinking?cfg.deepseekThinkingLevel:0;
+      level=(level+delta+4)%4;cfg.enableThinking=level!=0;
+      if(level)cfg.deepseekThinkingLevel=uint8_t(level);
+    } else cfg.enableThinking = !cfg.enableThinking;
     if (!cfg.enableThinking) cfg.showThinking = false;
     if (menuIndex >= menuItemCount()) menuIndex = menuItemCount() - 1;
     menuScroll = normalizedMenuScrollForIndex(menuIndex);
@@ -13370,6 +13555,7 @@ static void changeMenuValue(int delta, bool fast) {
     cfg.uiStyle = uint8_t(((int(cfg.uiStyle) - 1 + delta + UI_STYLE_COUNT) % UI_STYLE_COUNT) + 1);
   } else if (item == MenuLanguage) {
     cfg.uiLanguage = UiLanguage((int(cfg.uiLanguage) + delta + 2) % 2);
+    markChatLinesDirty();footerFrameKey="";footerStatusDetail="";
   }
   drawPage2Body();
 }
@@ -13728,7 +13914,7 @@ static void startDebugWebServer() {
       applied += "思考显示 ";
     }
     if (debugWeb.hasArg("search")) {
-      cfg.searchMode = SearchMode(constrain(debugWeb.arg("search").toInt(), 0, 3));
+      cfg.searchMode = camNormalizeSearchMode(debugWeb.arg("search").toInt());
       changed = true;
       applied += "搜索模式 ";
     }
@@ -13898,6 +14084,7 @@ static void menuMove(int delta, bool fast) {  clearChatConfirm = false;
 // Long-press B/C used to jump to the next/previous category.  That gesture is
 // now continuous scrolling (see handleButtonB/C), so this helper is unused.
 static void handleButtonA(bool click, bool longPress, bool repeat, bool released) {
+  draftEraseGesture.reset();
   (void)repeat;
   if (!click && !longPress && !released) return;
   if (released && !recording && !click) return;
@@ -14210,6 +14397,7 @@ static void handleButtonA(bool click, bool longPress, bool repeat, bool released
 }
 
 static void handleButtonB(bool click, bool longPress, bool repeat, bool released) {
+  draftEraseGesture.reset();
   if (!click && !longPress && !repeat && !released) return;
   if (released && chatRoundChordDir>0) {chatRoundChordDir=0;chatRoundChordLatched=false;}
   if (camVideoHandleKey('B', click, longPress, released)) return;
@@ -14276,6 +14464,7 @@ static void handleButtonB(bool click, bool longPress, bool repeat, bool released
 }
 
 static void handleButtonC(bool click, bool longPress, bool repeat, bool released) {
+  if(uiPage!=UiPage::Page1 || recording)draftEraseGesture.reset();
   if (!click && !longPress && !repeat && !released) return;
   if (released && chatRoundChordDir<0) {chatRoundChordDir=0;chatRoundChordLatched=false;}
   if (camVideoHandleKey('C', click, longPress, released)) return;
@@ -14305,6 +14494,15 @@ static void handleButtonC(bool click, bool longPress, bool repeat, bool released
   }
   if (uiPage == UiPage::Page1) {
     if (cfg.clockMode) return;
+    if(click && appState!=AppState::Thinking && appState!=AppState::Recognizing &&
+       draftEraseGesture.click(millis(),buttonUiGeneration.load(),composingQuestion)) {
+      pendingSegments.clear();pendingQuestion="";transcript="";
+      asrBestTranscript="";asrStableTranscript="";asrPartialTranscript="";
+      composingQuestion=false;appState=AppState::Idle;chatAutoScrollBottom=true;
+      markChatLinesDirty();drawPage1();
+      drawPage1Footer(uiText("语音草稿已清空","Voice draft cleared","Voice draft cleared"));return;
+    }
+
     if ((longPress || (click && pendingSegments.empty())) && camPhoto.confirmed) {
       if(appState==AppState::Thinking || appState==AppState::Recognizing)return;
       camRemoveQuestionPhoto(camQuestionPhotoCount()-1); applyChatLayout(); markChatLinesDirty(); drawPage1();
@@ -14328,7 +14526,7 @@ static void handleButtonC(bool click, bool longPress, bool repeat, bool released
       return;
     }
     if (click && composingQuestion && !recording) {
-      if (!pendingSegments.empty()) pendingSegments.pop_back();
+      camEraseDraftCharacter(pendingSegments);
       asrBestTranscript = "";
       asrStableTranscript = "";
       asrPartialTranscript = "";
@@ -14623,7 +14821,7 @@ void loop() {
   }
 
   if (recording) {
-    if (millis() - recordStartedAt >= camAsrRecordLimitMs(cfg.asrProvider==AsrProvider::CustomIat,MAX_RECORD_SECONDS)) {
+    if (millis() - recordStartedAt >= camAsrLiveBodyLimitMs(cfg.asrProvider==AsrProvider::CustomIat,MAX_RECORD_SECONDS,ASR_TAIL_CAPTURE_MS)) {
       stopRecordingAndAnswer();
       return;
     }
@@ -14631,16 +14829,26 @@ void loop() {
     if (!recording) return;
     if(usesIatV2()) {
       if(!bufferedMic.active()) { stopRecordingAndAnswer();return; }
-      if(cfg.asrProvider==AsrProvider::XfyunV2) {
+      if(cfg.asrProvider==AsrProvider::CustomIat && (asrHadError || !asrConnected || asrCompleted)) {
+        if(!lastError.length())lastError="ASR disconnected before audio end";
+        bufferedMic.cancel();bufferedMic.release();closeAsrSocket();recording=false;
+        setState(AppState::Error,lastError);return;
+      }
+      if(cfg.asrProvider==AsrProvider::XfyunV2 || cfg.asrProvider==AsrProvider::CustomIat) {
         const uint32_t ready=bufferedMic.samples.load(std::memory_order_acquire);
-        for(unsigned batch=0;batch<4 && ready-camIatLiveSentSamples>=640;++batch) {
-          if(!sendAsrAudio(reinterpret_cast<uint8_t*>(bufferedMic.data+camIatLiveSentSamples),1280,false)) {
+        const bool customLive=cfg.asrProvider==AsrProvider::CustomIat;
+        const uint32_t uploadStarted=millis();
+        for(unsigned batch=0;batch<4;++batch) {
+          const size_t count=camIatPublishedBatch(ready,camIatLiveSentSamples,customLive,false);
+          if(!count)break;
+          if(!sendAsrAudio(reinterpret_cast<uint8_t*>(bufferedMic.data+camIatLiveSentSamples),count*2,false)) {
             if(!lastError.length())lastError="ASR live audio send failed";
             bufferedMic.cancel();bufferedMic.release();closeAsrSocket();recording=false;
             setState(AppState::Error,lastError);return;
           }
-          camIatLiveSentSamples+=640;
+          camIatLiveSentSamples+=count;asrSentPcmBytes=camIatLiveSentSamples*2;
         }
+        asrUploadMs+=millis()-uploadStarted;
       }
       static uint32_t lastMicUi=0;
       if(millis()-lastMicUi>=100 && uiPage==UiPage::Page1 && !screenSleeping) {

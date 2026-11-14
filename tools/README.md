@@ -35,3 +35,8 @@ build-cam.ps1 / build-cam-probe.ps1 只编译，不自动烧录。capture-cam-cr
 相同环境变量运行 `test-v0415-web.py`（有界搜索、历史保存和严格 JSON）、`test-v0416-thumbs.py`（三图布局）、`test-v0417-render.py`（公式围栏/差商/角标）、`test-stream-reveal.py`（UTF-8 逐字）、`test-stream-bottom.py`（当帧贴底）、`test-media-index.py`（索引失效/失败/隐藏排序）。主机测试均不打开串口，也不向真实服务请求。
 
 `capture-chat-screen.py --port <核实后的串口> --command "ui screenshot" --output screen.png` 可获取板端绘制缓冲，需要 pyserial/Pillow。截图可能含个人对话或照片，请自行留在本地。
+
+
+## v0.4.31 定向回归
+
+沿用上述环境变量，运行 `test-v0427-history.py`、`test-v0427-scroll.py`、`test-v0428-scroll-motion.py`、`test-v0430-customiat-stream.py`、`test-v0431-meter.py` 与更新的 `test-v0417-render.py`。测试提取当前源码，只模拟文件/时钟/绘图/结果协议，不连接真实服务或麦克风。

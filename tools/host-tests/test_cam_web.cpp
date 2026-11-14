@@ -3,8 +3,10 @@
 #define ARDUINOJSON_ENABLE_ARDUINO_PRINT 0
 #define ARDUINOJSON_ENABLE_PROGMEM 0
 #include "Arduino.h"
+#include "cam_json_config.h"
 #include <ArduinoJson.h>
 #include <cassert>
+struct WebJsonAllocator:ArduinoJson::Allocator {void* allocate(size_t n)override{return malloc(n);}void deallocate(void*p)override{free(p);}void* reallocate(void*p,size_t n)override{return realloc(p,n);}}camJsonAllocator;
 #include <vector>
 #include <iostream>
 static uint32_t clockMs=0;
@@ -33,7 +35,7 @@ static std::vector<String> urls,bodies,auth;
 class HTTPClient{
  Reply reply;
 public:
- void setTimeout(unsigned){}void setConnectTimeout(unsigned){}void setUserAgent(const char*){}
+ void setReuse(bool){}void setTimeout(unsigned){}void setConnectTimeout(unsigned){}void setUserAgent(const char*){}
  template<class T>bool begin(T&,const String& url){urls.push_back(url);return true;}
  void addHeader(const String& name,const String& value){if(name=="Authorization")auth.push_back(value);}
  int POST(const String& body){bodies.push_back(body);assert(!replies.empty());reply=replies.front();replies.erase(replies.begin());return reply.status;}
@@ -71,8 +73,17 @@ static void resetWeb(){replies.clear();urls.clear();bodies.clear();auth.clear();
 int main(){
  {String digest;assert(buildTavilyDigestFromJson(R"({"results":[{"title":"中文\u6570\u5b66","url":"https://a.example/","content":"正文","score":0.9}]})","数学",digest));
   std::vector<CamWebSource> sources;camWebAddDigest(digest,sources);assert(sources.size()==1&&sources[0].url=="https://a.example/");assert(sources[0].title.indexOf("数学")>=0);}
- {resetWeb();String content;replies={{400,R"({"error":{"message":"unsupported thinking"}})"},llm("{\"search\":false,\"queries\":[]}")};
-  assert(camWebLlm("plan","math",content,"TEST"));assert(bodies.size()==2);JsonDocument minimal;assert(!deserializeJson(minimal,bodies[1]));assert(minimal["thinking"].isNull()&&minimal["reasoning_effort"].isNull()&&minimal["max_completion_tokens"].isNull());}
+ {resetWeb();cfg.llmModelId="claude-opus-5-5";String content;replies={llm("{\"search\":false,\"queries\":[]}")};
+  assert(camWebLlm("plan","math",content,"TEST"));JsonDocument req;assert(!deserializeJson(req,bodies[0]));assert(req["thinking"].isNull()&&req["reasoning_effort"].isNull()&&req["temperature"].isNull());
+  String task=req["messages"][1]["content"].as<String>();assert(task.indexOf("Task:\nplan")>=0&&task.indexOf("<input_data>\nmath")>=0);}
+ {resetWeb();cfg.llmModelId="deepseek-v4-flash";String content;replies={{400,"{}"},llm("{}")};
+  assert(camWebLlm("plan","math",content,"TEST"));assert(bodies.size()==2);JsonDocument minimal;assert(!deserializeJson(minimal,bodies[1]));assert(minimal["thinking"].isNull()&&minimal["reasoning_effort"].isNull());}
+ {resetWeb();cfg.llmModelId="gpt-6.1-terra";String content;replies={{400,"{}"},llm("{}")};
+  assert(camWebLlm("plan","math",content,"TEST"));JsonDocument minimal;assert(!deserializeJson(minimal,bodies[1]));assert(minimal["max_tokens"].isNull()&&minimal["max_completion_tokens"]==1536);}
+ {resetWeb();cfg.llmModelId="claude-opus-5-5";String content;replies={{401,"{}"}};assert(!camWebLlm("plan","math",content,"TEST")&&bodies.size()==1);}
+ {resetWeb();String response;replies={{-1,""},{200,"recovered"}};assert(camWebPost("https://example.com","fixture","{}",response,"TEST")&&response=="recovered"&&bodies.size()==2);}
+ {resetWeb();String response;replies={{-1,""},{-1,""}};assert(!camWebPost("https://example.com","fixture","{}",response,"TEST")&&bodies.size()==2);}
+ cfg.llmModelId="fixture-model";
  const String json=R"({"title":"a content \" trick","nested":{"content":"wrong"},"content":"中文 \u4e2d\u6587 \ud83d\ude00 \"quote\"\nend"})";
  for(size_t split:{1,2,3,7,37}){CamWebFetchSink sink;for(size_t p=0;p<json.length()&&!sink.ready;p+=split)sink.write((const uint8_t*)json.c_str()+p,min(split,json.length()-p));assert(sink.ready&&!sink.rejected);assert(sink.text=="中文 中文 😀 \"quote\"\nend");}
  {CamWebFetchSink sink;String j="{\"content\":\""+String(std::string(200000,'x'))+"\"}";sink.write((const uint8_t*)j.c_str(),j.length());assert(sink.ready&&sink.truncated&&sink.text.length()==1500);}
@@ -86,7 +97,16 @@ int main(){
  resetWeb();replies={llm(R"({"search":true,"queries":["q"]})"),{200,a},llm(R"({"keep":[99],"fetch":[]})")};assert(!camRunWebResearch("q",0,false,evidence,searched)&&evidence.empty());
  resetWeb();replies={llm(R"({"search":true,"queries":["q"]})"),{401,"{}"}};assert(!camRunWebResearch("q",0,false,evidence,searched)&&bodies.size()==2);
  resetWeb();replies={llm("not valid JSON")};assert(!camRunWebResearch("write a poem",0,false,evidence,searched)&&bodies.size()==1);
+ resetWeb();replies={llm("I cannot discuss that; unrelated prose")};{std::vector<String> queries;bool need=false;assert(!camWebPlan("请搜索 Python 官方文档",false,queries,need)&&need&&queries.size()==1);}
  resetWeb();pendingCancel=true;buttonEvents=(void*)1;assert(!camRunWebResearch("cancel",0,false,evidence,searched)&&camWebWasCancelled&&bodies.empty());buttonEvents=nullptr;
+ {const String one=R"({"results":[{"title":"One","url":"https://a.example/","summary":"First fact"}]})";
+  resetWeb();cfg.searchFetchEnabled=false;
+  replies={llm(R"({"search":true,"queries":["first query"]})"),{200,one},llm(R"({"query":"complementary query"})"),{200,b},llm(R"({"keep":[1,2],"fetch":[]})"),llm(R"({"items":[{"id":1,"summary":"Supported fact"}]})")};
+  assert(camRunWebResearch("verify sources",0,false,evidence,searched)&&replies.empty()&&camWebStats.queries==2&&camWebStats.found==3);
+  resetWeb();cfg.searchFetchEnabled=false;
+  replies={llm(R"({"search":true,"queries":["first query"]})"),{200,one},llm(R"({"query":"first query"})"),llm(R"({"keep":[],"fetch":[]})")};
+  assert(!camRunWebResearch("verify sources",0,false,evidence,searched)&&replies.empty()&&camWebStats.queries==1);
+ }
  camWebRunning=true;camWebStarted=0;clockMs=CAM_WEB_BUDGET_MS;assert(camWebCancelled());camWebRunning=false;
  std::cout<<"PASS: UTF-8/escaped Unicode streaming extraction; huge-page bound; Tavily extraction; two-query dedup; multi-page pipeline; source ownership; no-search; invalid IDs; authentication failure\n";
 }

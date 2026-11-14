@@ -2,13 +2,13 @@
 
 static bool chatSessionOnTf() { return cfg.currentSession > INTERNAL_SESSION_COUNT; }
 static String chatTfBoundIdentity;
-static bool chatStorageNotice=false;
+static bool chatStorageNotice=false,chatHistoryUnsaved=false;
 static fs::FS& chatStore() {
   return chatSessionOnTf() ? static_cast<fs::FS&>(SD_MMC) : static_cast<fs::FS&>(SPIFFS);
 }
 static bool chatStorageFailure() {
-  chatStorageNotice=true;
-  lastError=uiText("会话存储不可用：请检查原TF卡及剩余空间",
+  chatStorageNotice=true;chatHistoryUnsaved=true;
+  lastError=uiText(chatSessionOnTf()?"TF会话未保存：检查原卡和空间":"Flash会话未保存：检查空间或历史完整性",
       "Chat storage unavailable: check original TF card and free space",
       "Chat storage unavailable: check original TF card and free space");
   footerStatusDetail=lastError;
@@ -33,10 +33,10 @@ static String chatReadTfIdentity() {
   return String(id);
 }
 static bool chatStorageReady() {
-  if (!chatSessionOnTf()) {const bool ready=initFileSystem();if(ready)chatStorageNotice=false;return ready;}
+  if (!chatSessionOnTf()) {const bool ready=initFileSystem();if(ready && !chatHistoryUnsaved)chatStorageNotice=false;return ready;}
   const String identity=chatReadTfIdentity();
   if (!identity.length() || (chatTfBoundIdentity.length() && identity!=chatTfBoundIdentity)) return chatStorageFailure();
-  chatTfBoundIdentity=identity;chatStorageNotice=false;return true;
+  chatTfBoundIdentity=identity;if(!chatHistoryUnsaved)chatStorageNotice=false;return true;
 }
 
 // Keep a last-good file across replacement. A failed/new partial .tmp is never loaded.

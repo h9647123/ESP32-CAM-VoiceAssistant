@@ -3,8 +3,11 @@
 #define ARDUINOJSON_ENABLE_ARDUINO_PRINT 0
 #define ARDUINOJSON_ENABLE_PROGMEM 0
 #include "Arduino.h"
+#include "cam_json_config.h"
 #include <ArduinoJson.h>
 #include "cam_strict_json.h"
+#include "cam_history_io.h"
+#include "cam_llm_policy.h"
 #include <cassert>
 #include <map>
 #include <memory>
@@ -15,7 +18,10 @@ struct ChatMsg{String role;PsramString content;std::vector<CamChatImage> images;
 static std::vector<ChatMsg> chatHistory;
 static size_t chatHistoryBytes=0,chatHistoryPrefixBytes=0;
 static bool chatHistoryReadIncomplete=false;
-static bool camValidationMode=false;
+static bool camValidationMode=false,chatStorageNotice=false,chatHistoryUnsaved=false;
+struct HistoryJsonAllocator:ArduinoJson::Allocator {size_t peak=0;
+ void* allocate(size_t n)override{peak=max(peak,n);return malloc(n);}void deallocate(void*p)override{free(p);}void* reallocate(void*p,size_t n)override{peak=max(peak,n);return realloc(p,n);}
+}camJsonAllocator;
 static constexpr size_t MAX_HISTORY_BYTES=150000,MAX_HISTORY_LOAD_BYTES=32768,MIN_INTERNAL_FREE_AFTER_LOAD=98304;
 static constexpr int MALLOC_CAP_INTERNAL=1;
 static size_t availableHeap=80000;
@@ -67,7 +73,7 @@ static size_t chatRollingSummaryMsgs=0;
 static constexpr size_t LLM_SEARCH_CONTEXT_MAX_BYTES=2400;
 static bool llmTestIsolation=false;
 static String llmTimeContext(){return "Current date: 2026-11-02";}
-struct{int currentSession=1;String llmModelId="fixture",llmSystemPrompt;bool enableThinking=false;}cfg;
+struct{int currentSession=1;String llmModelId="fixture",llmApiUrl="https://llm.example/chat/completions",llmSystemPrompt;uint8_t deepseekThinkingLevel=2;bool enableThinking=false;}cfg;
 struct Log {template<class...T>void printf(const char*,T...){}void println(const String&){} }Serial;
 static bool saveChatHistory();
 #include "web_history_under_test.h"
@@ -121,6 +127,20 @@ int main(){
  for(size_t i=0;i<archived.length();++i)rows+=archived[i]=='\n';
  assert(rows==190);assert(archived.indexOf("0:")>=0&&archived.indexOf("189:")>=0);
  loadChatHistory();assert(saveChatHistory());assert(*files[chatHistoryPath()]==archived);
+ // A full long thought plus final body is one JSONL record, not a 32KB window.
+ files.clear();chatHistory.clear();chatHistoryBytes=chatHistoryPrefixBytes=0;
+ String thought(char(3));thought+=String(std::string(70000,'r'));thought+=char(3);thought+="FINAL-LONG-THOUGHT-END";
+ addChatMessage("user","long thought question",true);addChatMessage("assistant",thought,true);
+ const String longArchive=*files[chatHistoryPath()];
+ loadChatHistory();assert(!chatHistoryReadIncomplete&&!chatHistory.empty());assert(chatHistory.back().content==thought);
+ assert(saveChatHistory());assert(*files[chatHistoryPath()]==longArchive);
+ String display=camHistoryDisplayText(thought.c_str(),thought.length(),true,"[FOLDED]");
+ assert(display.length()<8500&&display.indexOf("[FOLDED]")>=0&&display.indexOf("FINAL-LONG-THOUGHT-END")>=0);
+ assert(camHistoryDisplayText(thought.c_str(),thought.length(),false,"")=="FINAL-LONG-THOUGHT-END");
+ // Rendering/folding cannot mutate either RAM or the persisted original.
+ assert(chatHistory.back().content==thought&&*files[chatHistoryPath()]==longArchive);
+ assert(camWebMessageContext(chatHistory.back(),false)=="FINAL-LONG-THOUGHT-END");
+ std::cout<<"PASS: single 70KB reasoning record loads across 32KB window and saves byte-identically; display fold preserves final text and archive\n";
  // A malformed row is evidence, not permission to silently drop it on save.
  *files[chatHistoryPath()]+="{broken}\n";
  String damaged=*files[chatHistoryPath()];loadChatHistory();assert(chatHistoryReadIncomplete);

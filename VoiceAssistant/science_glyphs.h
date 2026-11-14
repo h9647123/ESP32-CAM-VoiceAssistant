@@ -2663,7 +2663,9 @@ template<class Glyph, size_t N> static const Glyph* scienceGlyphLookup(const Gly
 }
 #include "traditional_glyphs.h"
 #include "common_science_glyphs.h"
+#include "readable_glyphs.h"
 static const ScienceGlyph* scienceGlyph(uint32_t cp) {
+  if(const auto* fixed=scienceGlyphLookup(kReadableGlyphs,cp))return fixed;
   const auto* glyph=scienceGlyphLookup(kScienceGlyphs,cp);
   if(!glyph)glyph=scienceGlyphLookup(kCommonScienceGlyphs,cp);
   return glyph?glyph:scienceGlyphLookup(kTraditionalGlyphs,cp);

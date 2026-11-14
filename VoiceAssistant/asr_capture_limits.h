@@ -10,6 +10,12 @@ static_assert(CUSTOM_IAT_MAX_RECORD_SECONDS >= 1 && CUSTOM_IAT_MAX_RECORD_SECOND
 static constexpr uint32_t camAsrRecordLimitMs(bool customIat,uint32_t legacySeconds) {
   return (customIat ? uint32_t(CUSTOM_IAT_MAX_RECORD_SECONDS) : legacySeconds)*1000U;
 }
+// CUSTOM's server limit includes release-key tail audio. Reserve the tail from
+// the interactive body rather than sending 60s + tail into a 60s gateway.
+static constexpr uint32_t camAsrLiveBodyLimitMs(bool customIat,uint32_t legacySeconds,uint32_t tailMs) {
+  return customIat ? (camAsrRecordLimitMs(true,legacySeconds)>tailMs ? camAsrRecordLimitMs(true,legacySeconds)-tailMs : 0U)
+                   : camAsrRecordLimitMs(false,legacySeconds);
+}
 static constexpr uint32_t camMicCapacitySamples(uint32_t rate,uint32_t recordingMs,uint32_t tailMs) {
   // Allocate the entire recording plus tail and 2s scheduler headroom. Use
   // milliseconds so a fractional-second tail is never rounded down.
