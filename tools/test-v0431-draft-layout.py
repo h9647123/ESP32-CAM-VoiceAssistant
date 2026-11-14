@@ -27,7 +27,8 @@ static void appendChatMessageLines(const ChatMsg& m,std::vector<String>& lines,s
 static void compare(){rebuildChatLines();auto rows=chatLines;auto roles=chatLineRoles;auto rounds=chatRoundStarts;rebuildBaseline();assert(rows==chatLines&&roles==chatLineRoles&&rounds==chatRoundStarts);}
 int main(){
  for(int i=0;i<100;++i){ChatMsg m;m.role=i%2?"assistant":"user";m.content="long formula "+String(i);chatHistory.push_back(m);}
- transcript="first";rebuildChatLines();calls=0;
+ transcript="";composingQuestion=false;rebuildChatLines();calls=0;
+ transcript="first";composingQuestion=true;rebuildChatLines();assert(calls==0);calls=0;
  for(unsigned i=0;i<100;++i){transcript="live word "+String(i);rebuildChatLines();}assert(calls==0);
  compare();chatHistory[1].content="same size replacement";compare();auto count=calls;chatHistory[1].content="same size replacemenX";rebuildChatLines();assert(calls==count+100);compare();
  cfg.showThinking=false;compare();cfg.uiLanguage=1;compare();CHAT_TEXT_MAX_WIDTH=180;compare();chatHistory[0].thinkingMs=7000;compare();chatHistory[0].thinkingActive=true;compare();chatHistory[0].images.push_back({"P-first.jpg",10});compare();chatHistory[0].images[0].path="P-other.jpg";compare();

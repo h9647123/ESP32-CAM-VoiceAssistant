@@ -4,30 +4,34 @@ from pathlib import Path
 import os,subprocess
 from source_blocks import get,endblock
 root=Path(__file__).resolve().parents[1];out=root/'validation/20261114-v0431/draft';out.mkdir(parents=True,exist_ok=True)
-s=(root/'VoiceAssistant/VoiceAssistant.ino').read_text(encoding='utf-8');fn=get(s,'handleButtonC');i=fn.index('    if(click && appState!=AppState::Thinking');b=fn.index('{',i);block=fn[i:endblock(fn,b)]
+production=(root/'VoiceAssistant/VoiceAssistant.ino').read_text(encoding='utf-8');s=production;fn=get(s,'handleButtonC');i=fn.index('    bool continueErasing=false;');condition=fn.index('    if(click && !continueErasing',i);b=fn.index('{',condition);block=fn[i:endblock(fn,b)]
 code=r'''#include "Arduino.h"
 #include <cassert>
 #include <iostream>
 #include "cam_draft_edit.h"
 static CamDraftEraseGesture draftEraseGesture;
 static std::vector<String> pendingSegments;static String pendingQuestion,transcript,asrBestTranscript,asrStableTranscript,asrPartialTranscript;
-static bool composingQuestion=true,chatAutoScrollBottom=false;enum class AppState{Idle,Thinking,Recognizing};static AppState appState=AppState::Idle;
+static bool draftClearConfirm=false,composingQuestion=true,chatAutoScrollBottom=false;enum class AppState{Idle,Thinking,Recognizing};static AppState appState=AppState::Idle;
 static uint32_t nowMs=1000;static uint32_t millis(){return nowMs;}
 static struct{uint32_t load(){return 1;}}buttonUiGeneration;
 static void markChatLinesDirty(){}static void drawPage1(){}static void drawPage1Footer(const String&){}
 static String uiText(const char*,const char* e,const char*){return e;}
+static String draftEditFooter(){return "confirmation";}
+'''+('static String footerSelection(const String& detail){'+get(production,'drawPage1Footer').split('  String text = ',1)[1].split(';',1)[0].join(['String text = ',';return text;}']))+r'''
+'''+get(production,'clearVoiceDraft')+r'''
 static void clickC(bool click){
 '''+block+r'''
 camEraseDraftCharacter(pendingSegments);
 nowMs+=700;draftEraseGesture.at=millis();
 }
 int main(){
+ draftClearConfirm=true;assert(footerSelection("")=="confirmation");assert(footerSelection("background refresh")=="confirmation");draftClearConfirm=false;assert(footerSelection("normal")=="normal");
  CamDraftEraseGesture g;assert(!g.click(1000,1,true));assert(g.click(1200,1,true));assert(!g.armed);
  assert(!g.click(2000,1,true));assert(!g.click(2351,1,true));assert(!g.click(2400,2,true));g.reset();assert(!g.click(2500,2,true));
  g.reset();assert(!g.click(100,1,false));assert(!g.click(200,1,false));g.reset();assert(!g.click(0xfffffff0u,1,true));assert(g.click(0x10,1,true));
- pendingSegments={"前一段","中文x"};clickC(true);assert(pendingSegments[1]=="中文");nowMs+=200;clickC(true);assert(pendingSegments.empty()&&pendingQuestion.length()==0&&transcript.length()==0&&!composingQuestion&&chatAutoScrollBottom);
+ pendingSegments={"前一段","中文x"};clickC(true);assert(pendingSegments[1]=="中文");nowMs+=200;clickC(true);assert(draftClearConfirm&&!pendingSegments.empty());nowMs+=100;clickC(true);assert(!draftClearConfirm&&!pendingSegments.empty());nowMs+=200;clickC(true);nowMs+=200;clickC(true);assert(draftClearConfirm);clearVoiceDraft();assert(pendingSegments.empty()&&pendingQuestion.length()==0&&transcript.length()==0&&!composingQuestion&&chatAutoScrollBottom);
  pendingSegments={"中"};draftEraseGesture.reset();composingQuestion=true;nowMs+=500;clickC(true);assert(pendingSegments.empty());composingQuestion=false;nowMs+=200;clickC(true);assert(!draftEraseGesture.armed);
- puts("PASS actual draft erase: UTF-8, multiple segments, whole-draft clear, last-character double click, timeout, generation, reset, timer wrap");
+ puts("PASS actual draft erase: UTF-8, multiple segments, double-C requires A; C continues deletion, last-character double click, timeout, generation, reset, timer wrap");
 }
 '''
 (out/'test.cpp').write_text(code,encoding='utf-8');host=root/'.build-host';host.mkdir(exist_ok=True);env=os.environ.copy()

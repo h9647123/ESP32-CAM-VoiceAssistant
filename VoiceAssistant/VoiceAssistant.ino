@@ -219,6 +219,7 @@
 #include "cam_history_io.h"
 #include "cam_draft_edit.h"
 static CamDraftEraseGesture draftEraseGesture;
+static bool draftClearConfirm=false;
 #include "cam_llm_policy.h"
 #include "cam_http_ui.h"
 #include "cam_capture.h"
@@ -4898,11 +4899,15 @@ static void rebuildChatLines() {
       if(msg.role=="user") chatRoundStarts.push_back(chatLines.size());
       appendChatMessageLines(msg, chatLines, chatLineRoles);
     }
+    while(!chatLines.empty() && !chatLines.back().length()) {
+      chatLines.pop_back();if(!chatLineRoles.empty())chatLineRoles.pop_back();
+    }
     cachedHistoryFingerprint=fingerprint;cachedHistoryRows=chatLines.size();
     cachedRoundCount=chatRoundStarts.size();historyLayoutCached=true;
   } else {
     chatLines.resize(cachedHistoryRows);chatLineRoles.resize(cachedHistoryRows);
   }
+  if(cachedHistoryRows){chatLines.push_back("");chatLineRoles.push_back(0);}
   if (transientSearchResult.length()) {
     size_t before = chatLines.size();
     wrapIntoLines(uiText("搜索：", "Search: ", "Search: ") + normalizeMarkdownBody(transientSearchResult),
@@ -6970,7 +6975,7 @@ static void drawPage1Footer(const String& detail) {
   const int y=footerSpriteReady?0:202;
   const uint16_t footerBg = footer.color565(12, 20, 30);
 
-  String text = detail;
+  String text = draftClearConfirm ? draftEditFooter() : detail;
   if (text.length()) footerStatusDetail = text;
   if (!text.length()) {
     if (appState == AppState::Listening) text = uiText("正在聆听...", "Listening...", "Listening...");
@@ -8118,7 +8123,17 @@ static void setState(AppState state, const String& detail) {
   }
 }
 
+static void clearVoiceDraft() {
+  draftClearConfirm=false;draftEraseGesture.reset();
+  pendingSegments.clear();pendingQuestion="";transcript="";
+  asrBestTranscript="";asrStableTranscript="";asrPartialTranscript="";
+  composingQuestion=false;appState=AppState::Idle;chatAutoScrollBottom=true;
+  markChatLinesDirty();drawPage1();
+  drawPage1Footer(uiText("语音草稿已清空","Voice draft cleared","Voice draft cleared"));
+}
+
 static String draftEditFooter() {
+  if(draftClearConfirm)return uiText("清空整段语音草稿？\nA确认 B取消 C继续删字","Clear all voice draft?\nA:yes B:no C:erase","Clear all voice draft?\nA:yes B:no C:erase");
   const String altLang = cfg.asrEnglishMode ? "CN" : "EN";
   return uiText("A发送 C删字 双C清空\n长A追加 长B:", "A:send C:erase 2C:clear\nHold A:add Hold B:", "A:send C:erase 2C:clear\nHold A:add Hold B:")+altLang;
 }
@@ -10838,7 +10853,7 @@ static bool askAndStoreChat(String question) {
 }
 
 static void startRecording() {
-  draftEraseGesture.reset();
+  draftEraseGesture.reset();draftClearConfirm=false;
   if (camPhotoOnly && !camQuestionRequiresPhoto && !camQuestionReadyForVoice && !composingQuestion) { camOpenPreview(); return; }
   if (!asrAppendMode && lastFailedQuestion.length()) {
     if (!camQuestionPhotoCount()) camReleasePhoto();
@@ -14128,6 +14143,12 @@ static void handleButtonA(bool click, bool longPress, bool repeat, bool released
     return;
   }
   if (noteInteraction()) return;
+  if(uiPage==UiPage::Page1 && !recording && draftClearConfirm) {
+    if(click)clearVoiceDraft();
+    else if(longPress){draftClearConfirm=false;drawPage1Footer(draftEditFooter());}
+    return;
+  }
+
   if (camVideoHandleKey('A', click, longPress, released)) return;
   if (camPhotoHandleKey('A', click, longPress)) return;
   if (uiPage == UiPage::Page1) {
@@ -14449,6 +14470,10 @@ static void handleButtonB(bool click, bool longPress, bool repeat, bool released
   if (released && !click) return;
   const bool woke = noteInteraction();
   if (woke) return;
+  if(uiPage==UiPage::Page1 && draftClearConfirm) {
+    draftClearConfirm=false;drawPage1Footer(draftEditFooter());return;
+  }
+
   if (recording) return;
   if (camPhotoHandleKey('B', click, longPress)) return;
   if (uiPage == UiPage::WifiScan) {
@@ -14504,7 +14529,7 @@ static void handleButtonB(bool click, bool longPress, bool repeat, bool released
 }
 
 static void handleButtonC(bool click, bool longPress, bool repeat, bool released) {
-  if(uiPage!=UiPage::Page1 || recording)draftEraseGesture.reset();
+  if(uiPage!=UiPage::Page1 || recording){draftEraseGesture.reset();draftClearConfirm=false;}
   if (!click && !longPress && !repeat && !released) return;
   if (released && chatRoundChordDir<0) {chatRoundChordDir=0;chatRoundChordLatched=false;}
   if (camVideoHandleKey('C', click, longPress, released)) return;
@@ -14534,13 +14559,17 @@ static void handleButtonC(bool click, bool longPress, bool repeat, bool released
   }
   if (uiPage == UiPage::Page1) {
     if (cfg.clockMode) return;
-    if(click && appState!=AppState::Thinking && appState!=AppState::Recognizing &&
+    bool continueErasing=false;
+    if(draftClearConfirm) {
+      draftClearConfirm=false;draftEraseGesture.reset();continueErasing=true;
+      if(!click){drawPage1Footer(draftEditFooter());return;}
+    }
+    if(click && !continueErasing && appState!=AppState::Thinking && appState!=AppState::Recognizing &&
        draftEraseGesture.click(millis(),buttonUiGeneration.load(),composingQuestion)) {
-      pendingSegments.clear();pendingQuestion="";transcript="";
-      asrBestTranscript="";asrStableTranscript="";asrPartialTranscript="";
-      composingQuestion=false;appState=AppState::Idle;chatAutoScrollBottom=true;
-      markChatLinesDirty();drawPage1();
-      drawPage1Footer(uiText("语音草稿已清空","Voice draft cleared","Voice draft cleared"));return;
+      if(!pendingSegments.empty()) {
+        draftClearConfirm=true;drawPage1Footer(draftEditFooter());
+      }
+      return;
     }
 
     if ((longPress || (click && pendingSegments.empty())) && camPhoto.confirmed) {
