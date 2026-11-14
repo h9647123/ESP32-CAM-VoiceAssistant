@@ -19,6 +19,7 @@ static String uiText(const char*,const char* e,const char*){return e;}
 static void clickC(bool click){
 '''+block+r'''
 camEraseDraftCharacter(pendingSegments);
+nowMs+=700;draftEraseGesture.at=millis();
 }
 int main(){
  CamDraftEraseGesture g;assert(!g.click(1000,1,true));assert(g.click(1200,1,true));assert(!g.armed);

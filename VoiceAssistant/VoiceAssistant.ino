@@ -4872,12 +4872,36 @@ static void appendChatMessageLines(const ChatMsg& msg,
 }
 
 static void rebuildChatLines() {
-  chatRoundStarts.clear();
-  chatLines.clear();
-  chatLineRoles.clear();
-  for (const ChatMsg& msg : chatHistory) {
-    if(msg.role=="user") chatRoundStarts.push_back(chatLines.size());
-    appendChatMessageLines(msg, chatLines, chatLineRoles);
+  // Only the live draft changes during ASR. Reuse the existing archive row
+  // prefix rather than parsing every historical formula for each interim word.
+  static uint64_t cachedHistoryFingerprint=0;
+  static size_t cachedHistoryRows=0,cachedRoundCount=0;
+  static bool historyLayoutCached=false;
+  uint64_t fingerprint=14695981039346656037ULL;
+  auto mix=[&](uint64_t value){fingerprint^=value;fingerprint*=1099511628211ULL;};
+  auto mixText=[&](const char* text,size_t bytes){mix(bytes);for(size_t i=0;i<bytes;++i)mix(uint8_t(text[i]));};
+  mix(chatHistory.size());mix(unsigned(cfg.uiLanguage));mix(cfg.showThinking);mix(CHAT_TEXT_MAX_WIDTH);
+  for(const auto& message:chatHistory){
+    mixText(message.role.c_str(),message.role.length());
+    mixText(message.content.c_str(),message.content.length());
+    mix(message.thinkingMs);mix(message.thinkingTimed);mix(message.thinkingComplete);mix(message.thinkingActive);
+
+    for(const auto& image:message.images){mixText(image.path.c_str(),image.path.length());mix(image.bytes);}
+  }
+  if(!historyLayoutCached || fingerprint!=cachedHistoryFingerprint ||
+     chatLines.size()<cachedHistoryRows || chatLineRoles.size()<cachedHistoryRows ||
+     chatRoundStarts.size()!=cachedRoundCount) {
+    chatRoundStarts.clear();
+    chatLines.clear();
+    chatLineRoles.clear();
+    for (const ChatMsg& msg : chatHistory) {
+      if(msg.role=="user") chatRoundStarts.push_back(chatLines.size());
+      appendChatMessageLines(msg, chatLines, chatLineRoles);
+    }
+    cachedHistoryFingerprint=fingerprint;cachedHistoryRows=chatLines.size();
+    cachedRoundCount=chatRoundStarts.size();historyLayoutCached=true;
+  } else {
+    chatLines.resize(cachedHistoryRows);chatLineRoles.resize(cachedHistoryRows);
   }
   if (transientSearchResult.length()) {
     size_t before = chatLines.size();
@@ -7653,7 +7677,15 @@ static String menuItemTitle(MenuItem item) {
   return "设备信息";
 }
 
+static bool menuItemDirectToggle(MenuItem item) {
+  if(item==MenuAsr || item==MenuLanguage || item==MenuThinkingDisplay)return true;
+  if(item==MenuCamera || item==MenuPhotoOnly || item==MenuQuestionMode || item==MenuSearch)return true;
+  if(item==MenuEnableThinking)return !camDeepSeekPolicy(cfg.llmModelId,cfg.llmApiUrl);
+  return false;
+}
+
 static String menuItemControlHint(MenuItem item) {
+  if(menuItemDirectToggle(item))return uiText("按A切换 B/C选择 长A返回","A:toggle B/C:move HoldA:back","A:toggle B/C:move HoldA:back");
   if(item==MenuImageOnly)return uiText("A:发送/选图 长A:上级","A:send/select Hold A:back","A:send/select Hold A:back");
   if (item == MenuAlbum || item == MenuWifiScan || item == MenuVideos) return uiText("A:打开 B/C:移动 长A:上级","A:open B/C:move Hold A:back","A:open B/C:move Hold A:back");
   if (item == MenuClearChat) {
@@ -14259,6 +14291,14 @@ static void handleButtonA(bool click, bool longPress, bool repeat, bool released
     menuEditing=false; drawPage2(); return;
   }
   MenuItem item = menuItemAt(menuIndex);
+  if(menuItemDirectToggle(item)) {
+    menuEditing=false;clearChatConfirm=false;localSettingEditActive=false;
+    changeMenuValue(1,false);
+    if(item==MenuCamera || item==MenuPhotoOnly || item==MenuQuestionMode)camSaveSettings();
+    else saveRuntimeConfig();
+    drawPage2();return;
+  }
+
   if(item==MenuSearchSources){camShowSearchSources();return;}
   if(item==MenuImageOnly) {camSendImagesOnly();return;}
   if (item == MenuVideos) { camOpenVideos(); return; }
@@ -14545,6 +14585,8 @@ static void handleButtonC(bool click, bool longPress, bool repeat, bool released
         drawChatWindow(true);
         drawPage1Footer(draftEditFooter());
       }
+      // Exclude time spent repainting the first erase from the next-tap window.
+      draftEraseGesture.at=millis();
       return;
     }
     if(longPress || repeat) { chatRoundChordDir=-1; if(!chatRoundChordLatched)scrollChat(-1,true); }

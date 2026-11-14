@@ -40,3 +40,5 @@ build-cam.ps1 / build-cam-probe.ps1 只编译，不自动烧录。capture-cam-cr
 ## v0.4.31 定向回归
 
 沿用上述环境变量，运行 `test-v0427-history.py`、`test-v0427-scroll.py`、`test-v0428-scroll-motion.py`、`test-v0430-customiat-stream.py`、`test-v0431-meter.py` 与更新的 `test-v0417-render.py`。测试提取当前源码，只模拟文件/时钟/绘图/结果协议，不连接真实服务或麦克风。
+
+`test-v0431-draft.py` 覆盖 UTF-8 单删、双 C 整段清空和长重绘；`test-v0431-draft-layout.py` 对照完整重排，验证增量草稿复用历史、同长度修改及配置变化的缓存失效。
